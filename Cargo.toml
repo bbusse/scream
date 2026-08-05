@@ -1,0 +1,16 @@
+[package]
+name = "scream"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gstreamer = "0.21"
+gstreamer-app = "0.21"
+gstreamer-rtsp-server = "0.21"
+glib = "0.18"
+clap = { version = "4.4", features = ["derive"] }
+signal-hook = "0.3"
+memmap2 = "0.9"
+tempfile = "3"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
