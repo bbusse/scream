@@ -1,0 +1,39 @@
+name: Build Alpine Package
+
+on:
+  push:
+    paths-ignore:
+      - '**.md'
+    branches:
+      - '**'
+    tags:
+      - 'rc-*'
+      - 'release-*'
+  pull_request:
+    paths-ignore:
+      - '**.md'
+    branches:
+      - '**'
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    uses: bbusse/github-workflows/.github/workflows/build-apk.yml@dev
+    with:
+      artifact_name: scream
+      build_from_source: true
+    secrets: inherit
+
+  release:
+    needs:
+      - build-apk
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    uses: bbusse/github-workflows/.github/workflows/release.yml@dev
+    with:
+      artifact_name: scream
+      binary_name: scream
+      release_branch: ci
+      version_branch: dev
+    secrets: inherit
