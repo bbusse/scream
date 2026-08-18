@@ -4,10 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-gstreamer = "0.21"
-gstreamer-app = "0.21"
-gstreamer-rtsp-server = "0.21"
-glib = "0.18"
+gstreamer = "0.25"
+gstreamer-app = "0.25"
+gstreamer-rtsp-server = "0.25"
+glib = "0.22"
 clap = { version = "4.4", features = ["derive"] }
 signal-hook = "0.3"
 memmap2 = "0.9"
