@@ -11,7 +11,7 @@ use gstreamer_rtsp_server::{RTSPMediaFactory, RTSPServer};
 use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 use std::os::unix::io::AsFd;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
 use wayland_client::protocol::{
@@ -65,6 +65,19 @@ struct Args {
     /// Composite canvas height; defaults to wl_output height (toplevel mode only)
     #[arg(long)]
     height: Option<u32>,
+    /// Frames per second to capture and encode
+    #[arg(long, default_value = "30")]
+    framerate: u32,
+}
+
+static FRAMERATE: AtomicU32 = AtomicU32::new(30);
+
+fn framerate() -> u32 {
+    FRAMERATE.load(Ordering::Relaxed)
+}
+
+fn frame_interval() -> Duration {
+    Duration::from_millis(1000 / framerate().max(1) as u64)
 }
 
 // Shared types
@@ -627,7 +640,7 @@ impl CompositorPipeline {
             .field("format", "BGRx")
             .field("width", out_w as i32)
             .field("height", out_h as i32)
-            .field("framerate", gst::Fraction::new(30, 1))
+            .field("framerate", gst::Fraction::new(framerate() as i32, 1))
             .build());
 
         let compositor = gst::ElementFactory::make("compositor").build().expect("compositor");
@@ -669,7 +682,7 @@ impl CompositorPipeline {
 
         let placeholder_caps = gst::Caps::builder("video/x-raw")
             .field("format", "BGRx").field("width", 16i32).field("height", 16i32)
-            .field("framerate", gst::Fraction::new(30, 1)).build();
+            .field("framerate", gst::Fraction::new(framerate() as i32, 1)).build();
         let appsrc = gst_app::AppSrc::builder()
             .is_live(true).do_timestamp(true).format(gst::Format::Time)
             .caps(&placeholder_caps).build();
@@ -825,7 +838,7 @@ fn feed_loop(shared: SharedPipeline, shutdown: Arc<AtomicBool>) {
                             .field("format", frame.gst_format)
                             .field("width",  frame.width as i32)
                             .field("height", frame.height as i32)
-                            .field("framerate", gst::Fraction::new(30, 1))
+                            .field("framerate", gst::Fraction::new(framerate() as i32, 1))
                             .build();
                         s.appsrc.set_caps(Some(&caps));
                         s.caps_set = true;
@@ -835,7 +848,7 @@ fn feed_loop(shared: SharedPipeline, shutdown: Arc<AtomicBool>) {
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(33));
+        std::thread::sleep(frame_interval());
     }
 }
 
@@ -1038,7 +1051,7 @@ fn run_capture_output(appsrc: gst_app::AppSrc, shutdown: Arc<AtomicBool>) {
                     .field("format", frame.gst_format)
                     .field("width",  frame.width as i32)
                     .field("height", frame.height as i32)
-                    .field("framerate", gst::Fraction::new(30, 1))
+                    .field("framerate", gst::Fraction::new(framerate() as i32, 1))
                     .build();
                 appsrc.set_caps(Some(&caps));
                 caps_set = true;
@@ -1046,7 +1059,7 @@ fn run_capture_output(appsrc: gst_app::AppSrc, shutdown: Arc<AtomicBool>) {
             let buf = gst::Buffer::from_slice(frame.pixels);
             if appsrc.push_buffer(buf).is_err() { return; }
         }
-        std::thread::sleep(Duration::from_millis(33));
+        std::thread::sleep(frame_interval());
     }
 }
 
@@ -1055,6 +1068,7 @@ fn main() {
     gst::init().expect("GStreamer init");
 
     let args = Args::parse();
+    FRAMERATE.store(args.framerate.max(1), Ordering::Relaxed);
 
     let server = RTSPServer::new();
     server.set_address(&args.bind_address);
@@ -1065,13 +1079,14 @@ fn main() {
 
     match args.mode {
         Mode::Output => {
-            factory.set_launch(
+            factory.set_launch(&format!(
                 "appsrc name=mysrc is-live=true do-timestamp=true format=time \
-                 caps=video/x-raw,format=BGRx,width=16,height=16,framerate=30/1 \
+                 caps=video/x-raw,format=BGRx,width=16,height=16,framerate={fps}/1 \
                  ! videoconvert ! video/x-raw,format=I420 \
                  ! x264enc speed-preset=ultrafast tune=zerolatency \
-                 ! rtph264pay name=pay0 pt=96"
-            );
+                 ! rtph264pay name=pay0 pt=96",
+                fps = framerate()
+            ));
             factory.connect_media_configure(move |_, media| {
                 let element = media.element();
                 let bin     = element.downcast_ref::<gst::Bin>().unwrap();
@@ -1096,10 +1111,11 @@ fn main() {
                 });
 
             // Placeholder launch string; the real pipeline is injected via take_pipeline
-            factory.set_launch(
-                "videotestsrc ! video/x-raw,format=I420,width=16,height=16,framerate=30/1 \
-                 ! x264enc speed-preset=ultrafast ! rtph264pay name=pay0 pt=96"
-            );
+            factory.set_launch(&format!(
+                "videotestsrc ! video/x-raw,format=I420,width=16,height=16,framerate={fps}/1 \
+                 ! x264enc speed-preset=ultrafast ! rtph264pay name=pay0 pt=96",
+                fps = framerate()
+            ));
             factory.connect_media_configure(move |_, media| {
                 let shutdown = Arc::new(AtomicBool::new(false));
                 media.connect_unprepared({
