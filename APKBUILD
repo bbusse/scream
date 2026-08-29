@@ -6,7 +6,7 @@ pkgdesc="Wayland RTSP server using ext-image-copy-capture-v1 for screencopy"
 url="https://github.com/bbusse/scream"
 arch="all"
 license="BSD-3-Clause"
-depends="gst-plugins-base gst-plugins-good gst-plugins-ugly gst-rtsp-server"
+depends="gst-moonshine"
 makedepends="cargo rust gstreamer-dev gst-rtsp-server-dev gst-plugins-base-dev glib-dev wayland-dev wayland-protocols-dev"
 # Built directly from this checkout (no source= fetch), so builddir points
 # straight at $startdir. srcdir is redirected off to the side: abuild's
