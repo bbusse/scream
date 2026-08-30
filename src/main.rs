@@ -5,6 +5,14 @@
 
 use clap::Parser;
 use gstreamer::{self as gst, prelude::*};
+
+use scream::dlna;
+use scream::http::Request;
+use scream::layout::Grid;
+use scream::metrics::{
+    self, ClientGuard, CLIENTS_MJPEG, CLIENTS_MKV, CLIENTS_RTSP, CLIENTS_SNAPSHOT,
+    CLIENTS_WEBM, SNAPSHOTS_TOTAL,
+};
 use gstreamer_app as gst_app;
 use gstreamer_rtsp_server::prelude::*;
 use gstreamer_rtsp_server::{RTSPMediaFactory, RTSPServer};
@@ -74,6 +82,18 @@ struct Args {
     /// Port for the http mjpeg stream a browser can display, 0 disables it
     #[arg(long, default_value = "7002")]
     http_port: u16,
+    /// Do not announce the stream over ssdp for dlna players
+    #[arg(long)]
+    no_dlna: bool,
+    /// The name dlna players list the stream under
+    #[arg(long, default_value = "ISS Display")]
+    dlna_name: String,
+}
+
+static DLNA_NAME: OnceLock<String> = OnceLock::new();
+
+fn dlna_name() -> &'static str {
+    DLNA_NAME.get().map(|s| s.as_str()).unwrap_or("ISS Display")
 }
 
 static FRAMERATE: AtomicU32 = AtomicU32::new(30);
@@ -84,6 +104,19 @@ fn framerate() -> u32 {
 
 fn frame_interval() -> Duration {
     Duration::from_millis(1000 / framerate().max(1) as u64)
+}
+
+// A short queue that drops the oldest frame rather than block: the live
+// sources and the compositor must never wait on each other, and 200 ms of
+// slack is enough for the encoder and the rtsp appsink to meet their deadline
+fn make_queue() -> gst::Element {
+    gst::ElementFactory::make("queue")
+        .property("max-size-time", 200_000_000u64)
+        .property("max-size-bytes", 0u32)
+        .property("max-size-buffers", 0u32)
+        .property_from_str("leaky", "downstream")
+        .build()
+        .expect("queue")
 }
 
 // Shared types
@@ -188,47 +221,64 @@ fn log_http(msg: &str) {
     eprintln!("http: {msg}");
 }
 
-fn request_target(stream: &TcpStream) -> Option<String> {
-    use std::io::{BufRead, BufReader};
-    let mut line = String::new();
-    BufReader::new(stream).read_line(&mut line).ok()?;
-    let mut parts = line.split_whitespace();
-    let method = parts.next()?;
-    let target = parts.next()?.to_string();
-    if method != "GET" {
-        return None;
-    }
-
-    Some(target)
-}
-
-fn handle_http(mut stream: TcpStream) -> std::io::Result<()> {
-    let target = match request_target(&stream) {
-        Some(t) => t,
-        None => {
-            stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")?;
-            return Ok(());
-        }
-    };
-
-    ensure_capture();
-    let mut encoder = match JpegEncoder::new() {
-        Ok(e) => e,
+fn jpeg_encoder(stream: &mut TcpStream) -> std::io::Result<Option<JpegEncoder>> {
+    match JpegEncoder::new() {
+        Ok(encoder) => Ok(Some(encoder)),
         Err(e) => {
             log_http(&format!("no jpeg encoder: {e}"));
             stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")?;
+            Ok(None)
+        }
+    }
+}
+
+fn handle_http(mut stream: TcpStream) -> std::io::Result<()> {
+    let request = match Request::parse(&mut std::io::BufReader::new(&stream)) {
+        Some(r) => r,
+        None => {
+            stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")?;
             return Ok(());
         }
     };
 
-    let path = target.split('?').next().unwrap_or("/");
-    match path {
+    let path = request.path().to_string();
+
+    // The dlna endpoints answer descriptions and SOAP, not video: they must
+    // not spin up capture or an encoder
+    if dlna::handle_request(&mut stream, &request.method, &path,
+                            &request.headers, &request.body, dlna_name())? {
+        return Ok(());
+    }
+
+    if request.method != "GET" {
+        stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")?;
+        return Ok(());
+    }
+
+    // Answered without capture or an encoder, so a scrape never wakes the
+    // pipeline
+    if path == "/metrics" {
+        let body = metrics::metrics_body();
+        stream.write_all(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()).as_bytes())?;
+        stream.write_all(body.as_bytes())?;
+        return Ok(());
+    }
+
+    ensure_capture();
+    match path.as_str() {
         "/snapshot" | "/screenshot" => {
+            SNAPSHOTS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            let _guard = ClientGuard::new(&CLIENTS_SNAPSHOT);
+            let Some(mut encoder) = jpeg_encoder(&mut stream)? else {
+                return Ok(());
+            };
             // One frame, for a save button or anything expecting a still
             for _ in 0..40 {
                 if let Some(jpeg) = latest_jpeg(&mut encoder) {
                     stream.write_all(format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nCache-Control: no-store\r\nContent-Length: {}\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nContent-Length: {}\r\n\r\n",
                         jpeg.len()).as_bytes())?;
                     stream.write_all(&jpeg)?;
                     return Ok(());
@@ -238,51 +288,36 @@ fn handle_http(mut stream: TcpStream) -> std::io::Result<()> {
             stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")?;
         }
         "/" | "/webm" => {
-            // Chunked, so the response never ends and the browser keeps
-            // playing what arrives. Content-Length would be a lie here
-            let mut webm = match WebmEncoder::new() {
-                Ok(w) => w,
+            let _guard = ClientGuard::new(&CLIENTS_WEBM);
+            match StreamEncoder::webm() {
+                Ok(encoder) => stream_chunked(&mut stream, encoder,
+                                              "video/webm")?,
                 Err(e) => {
                     log_http(&format!("no webm encoder: {e}"));
                     stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")?;
-                    return Ok(());
                 }
-            };
-            stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: video/webm\r\nCache-Control: no-store\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n")?;
-
-            let mut idle = 0u32;
-            loop {
-                let frame = frames().lock().ok().and_then(|f| f.clone());
-                match frame {
-                    Some(f) => {
-                        idle = 0;
-                        if !webm.push(&f) {
-                            log_http("webm appsrc rejected a buffer, closing");
-                            break;
-                        }
-                    }
-                    None => {
-                        idle += 1;
-                        if idle > 200 {
-                            log_http("no frames to stream, closing");
-                            break;
-                        }
-                    }
-                }
-                while let Some(chunk) = webm.pull() {
-                    write!(stream, "{:x}\r\n", chunk.len())?;
-                    stream.write_all(&chunk)?;
-                    stream.write_all(b"\r\n")?;
-                    stream.flush()?;
-                }
-                std::thread::sleep(frame_interval());
             }
-            let _ = stream.write_all(b"0\r\n\r\n");
+        }
+        // h264 in matroska is what the shipped plugins can produce for a
+        // dlna player like the ps4, which plays neither vp8 nor rtsp
+        "/stream.mkv" => {
+            let _guard = ClientGuard::new(&CLIENTS_MKV);
+            match StreamEncoder::matroska_h264() {
+                Ok(encoder) => stream_chunked(&mut stream, encoder,
+                                              "video/x-matroska")?,
+                Err(e) => {
+                    log_http(&format!("no matroska encoder: {e}"));
+                    stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")?;
+                }
+            }
         }
         "/mjpeg" => {
+            let _guard = ClientGuard::new(&CLIENTS_MJPEG);
+            let Some(mut encoder) = jpeg_encoder(&mut stream)? else {
+                return Ok(());
+            };
             stream.write_all(
-                b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=screamframe\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")?;
+                b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=screamframe\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")?;
             loop {
                 match latest_jpeg(&mut encoder) {
                     Some(jpeg) => {
@@ -304,22 +339,58 @@ fn handle_http(mut stream: TcpStream) -> std::io::Result<()> {
     Ok(())
 }
 
-// vp8 in webm, muxed for streaming, is what a browser <video> plays over a
-// plain chunked http response: no MSE, no signalling and no javascript, unlike
-// hls which desktop chrome and firefox will not touch without hls.js
-struct WebmEncoder {
+// Chunked, so the response never ends and the client keeps playing what
+// arrives. Content-Length would be a lie here
+fn stream_chunked(stream: &mut TcpStream, mut encoder: StreamEncoder,
+                  content_type: &str) -> std::io::Result<()> {
+    stream.write_all(format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").as_bytes())?;
+
+    let mut idle = 0u32;
+    loop {
+        let frame = frames().lock().ok().and_then(|f| f.clone());
+        match frame {
+            Some(f) => {
+                idle = 0;
+                if !encoder.push(&f) {
+                    log_http("appsrc rejected a buffer, closing");
+                    break;
+                }
+            }
+            None => {
+                idle += 1;
+                if idle > 200 {
+                    log_http("no frames to stream, closing");
+                    break;
+                }
+            }
+        }
+        while let Some(chunk) = encoder.pull() {
+            write!(stream, "{:x}\r\n", chunk.len())?;
+            stream.write_all(&chunk)?;
+            stream.write_all(b"\r\n")?;
+            stream.flush()?;
+        }
+        std::thread::sleep(frame_interval());
+    }
+    let _ = stream.write_all(b"0\r\n\r\n");
+
+    Ok(())
+}
+
+// One encode-and-mux pipeline per http client. vp8 in webm is what a browser
+// <video> plays over a plain chunked http response: no MSE, no signalling and
+// no javascript, unlike hls which desktop chrome and firefox will not touch
+// without hls.js. h264 in matroska is the same shape for dlna players
+struct StreamEncoder {
     appsrc: gst_app::AppSrc,
     sink: gst_app::AppSink,
     pipeline: gst::Pipeline,
     caps_set: bool,
 }
 
-impl WebmEncoder {
-    fn new() -> Result<Self, String> {
-        let pipeline = gst::Pipeline::new();
-        let appsrc = gst_app::AppSrc::builder()
-            .is_live(true).do_timestamp(true).format(gst::Format::Time).build();
-        let convert = gst::ElementFactory::make("videoconvert").build().map_err(|e| e.to_string())?;
+impl StreamEncoder {
+    fn webm() -> Result<Self, String> {
         // deadline=1 is vp8's realtime mode; without it the encoder happily
         // spends far longer than a frame interval on a frame
         let enc = gst::ElementFactory::make("vp8enc")
@@ -330,6 +401,30 @@ impl WebmEncoder {
         let mux = gst::ElementFactory::make("webmmux")
             .property("streamable", true)
             .build().map_err(|e| e.to_string())?;
+
+        Self::build(enc, mux)
+    }
+
+    fn matroska_h264() -> Result<Self, String> {
+        // The same encode the rtsp stream runs; a short keyframe interval so
+        // a player joining the live stream starts within a couple of seconds
+        let enc = gst::ElementFactory::make("x264enc")
+            .property_from_str("speed-preset", "ultrafast")
+            .property_from_str("tune", "zerolatency")
+            .property("key-int-max", 60u32)
+            .build().map_err(|e| e.to_string())?;
+        let mux = gst::ElementFactory::make("matroskamux")
+            .property("streamable", true)
+            .build().map_err(|e| e.to_string())?;
+
+        Self::build(enc, mux)
+    }
+
+    fn build(enc: gst::Element, mux: gst::Element) -> Result<Self, String> {
+        let pipeline = gst::Pipeline::new();
+        let appsrc = gst_app::AppSrc::builder()
+            .is_live(true).do_timestamp(true).format(gst::Format::Time).build();
+        let convert = gst::ElementFactory::make("videoconvert").build().map_err(|e| e.to_string())?;
         let sink = gst_app::AppSink::builder().sync(false).max_buffers(4).drop(false).build();
         pipeline.add_many([appsrc.upcast_ref(), &convert, &enc, &mux, sink.upcast_ref()])
             .map_err(|e| e.to_string())?;
@@ -337,7 +432,7 @@ impl WebmEncoder {
             .map_err(|e| e.to_string())?;
         pipeline.set_state(gst::State::Playing).map_err(|e| e.to_string())?;
 
-        Ok(WebmEncoder { appsrc, sink, pipeline, caps_set: false })
+        Ok(StreamEncoder { appsrc, sink, pipeline, caps_set: false })
     }
 
     fn push(&mut self, frame: &LatestFrame) -> bool {
@@ -363,7 +458,7 @@ impl WebmEncoder {
     }
 }
 
-impl Drop for WebmEncoder {
+impl Drop for StreamEncoder {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gst::State::Null);
     }
@@ -890,7 +985,7 @@ struct PipelineStream {
     identifier: String,
     slot: FrameSlot,
     appsrc: gst_app::AppSrc,
-    chain: Vec<gst::Element>, // videoconvert, videoscale, capsfilter
+    chain: Vec<gst::Element>, // videoconvert, videoscale, capsfilter, queue
     comp_sink: gst::Pad,
     caps_set: bool,
     capture_shutdown: Arc<AtomicBool>,
@@ -936,32 +1031,41 @@ impl CompositorPipeline {
         let encoder = gst::ElementFactory::make("x264enc")
             .property_from_str("speed-preset", "ultrafast")
             .property_from_str("tune", "zerolatency")
+            .property("key-int-max", framerate())
             .build().expect("x264enc");
+        // Buffering ahead of the encoder and ahead of the rtsp server's appsink
+        // so neither hits its processing deadline with nothing queued
+        let bg_queue = make_queue();
+        let out_queue = make_queue();
+        let pay_queue = make_queue();
         let pay = gst::ElementFactory::make("rtph264pay")
             .name("pay0")
             .property("pt", 96u32)
+            .property("config-interval", -1i32)
             .build().expect("rtph264pay");
 
-        pipeline.add_many([&bg_src, &bg_caps_filter, &compositor,
-                           &out_caps_filter, &post_convert, &encoder, &pay]).unwrap();
+        pipeline.add_many([&bg_src, &bg_caps_filter, &bg_queue, &compositor,
+                           &out_caps_filter, &out_queue, &post_convert,
+                           &encoder, &pay_queue, &pay]).unwrap();
 
-        gst::Element::link_many([&bg_src, &bg_caps_filter]).unwrap();
+        gst::Element::link_many([&bg_src, &bg_caps_filter, &bg_queue]).unwrap();
         let bg_sink = compositor.request_pad_simple("sink_%u").expect("compositor bg sink");
         bg_sink.set_property("zorder", 0i32);
         bg_sink.set_property("xpos", 0i32);
         bg_sink.set_property("ypos", 0i32);
         bg_sink.set_property("width", out_w as i32);
         bg_sink.set_property("height", out_h as i32);
-        bg_caps_filter.static_pad("src").unwrap().link(&bg_sink).unwrap();
+        bg_queue.static_pad("src").unwrap().link(&bg_sink).unwrap();
 
-        gst::Element::link_many([&compositor, &out_caps_filter, &post_convert, &encoder, &pay]).unwrap();
+        gst::Element::link_many([&compositor, &out_caps_filter, &out_queue,
+                                 &post_convert, &encoder, &pay_queue, &pay]).unwrap();
 
         CompositorPipeline { pipeline, compositor, out_caps_filter, streams: Vec::new(), out_w, out_h }
     }
 
     fn add_stream(&mut self, identifier: String, slot: FrameSlot, capture_shutdown: Arc<AtomicBool>) {
         let n = self.streams.len() + 1; // account for the background occupying sink_0
-        let (cell_w, cell_h) = grid_cell(n, self.out_w, self.out_h);
+        let Grid { cell_w, cell_h, .. } = Grid::new(n, self.out_w, self.out_h);
 
         let placeholder_caps = gst::Caps::builder("video/x-raw")
             .field("format", "BGRx").field("width", 16i32).field("height", 16i32)
@@ -975,21 +1079,22 @@ impl CompositorPipeline {
         let cf      = gst::ElementFactory::make("capsfilter").build().expect("capsfilter");
         cf.set_property("caps", &gst::Caps::builder("video/x-raw")
             .field("width", cell_w as i32).field("height", cell_h as i32).build());
+        let queue = make_queue();
 
-        self.pipeline.add_many([appsrc.upcast_ref(), &convert, &scale, &cf]).unwrap();
-        gst::Element::link_many([appsrc.upcast_ref(), &convert, &scale, &cf]).unwrap();
+        self.pipeline.add_many([appsrc.upcast_ref(), &convert, &scale, &cf, &queue]).unwrap();
+        gst::Element::link_many([appsrc.upcast_ref(), &convert, &scale, &cf, &queue]).unwrap();
 
         let comp_sink = self.compositor.request_pad_simple("sink_%u").expect("compositor sink");
         comp_sink.set_property("zorder", 1i32);
-        cf.static_pad("src").unwrap().link(&comp_sink).unwrap();
+        queue.static_pad("src").unwrap().link(&comp_sink).unwrap();
 
-        for el in [appsrc.upcast_ref(), &convert, &scale, &cf] {
+        for el in [appsrc.upcast_ref(), &convert, &scale, &cf, &queue] {
             el.sync_state_with_parent().ok();
         }
 
         self.streams.push(PipelineStream {
             identifier, slot, appsrc,
-            chain: vec![convert, scale, cf],
+            chain: vec![convert, scale, cf, queue],
             comp_sink, caps_set: false, capture_shutdown,
         });
 
@@ -1023,17 +1128,13 @@ impl CompositorPipeline {
     fn recalculate_layout(&self) {
         let n = self.streams.len();
         if n == 0 { return; }
-        let cols = (n as f64).sqrt().ceil() as u32;
-        let rows = (n as u32 + cols - 1) / cols;
-        let cell_w = self.out_w / cols;
-        let cell_h = self.out_h / rows;
+        let grid = Grid::new(n, self.out_w, self.out_h);
         for (i, s) in self.streams.iter().enumerate() {
-            let col = i as u32 % cols;
-            let row = i as u32 / cols;
-            s.comp_sink.set_property("xpos",   (col * cell_w) as i32);
-            s.comp_sink.set_property("ypos",   (row * cell_h) as i32);
-            s.comp_sink.set_property("width",  cell_w as i32);
-            s.comp_sink.set_property("height", cell_h as i32);
+            let (xpos, ypos) = grid.cell_origin(i);
+            s.comp_sink.set_property("xpos",   xpos as i32);
+            s.comp_sink.set_property("ypos",   ypos as i32);
+            s.comp_sink.set_property("width",  grid.cell_w as i32);
+            s.comp_sink.set_property("height", grid.cell_h as i32);
         }
     }
 
@@ -1045,13 +1146,6 @@ impl CompositorPipeline {
             .field("width", w as i32).field("height", h as i32).build());
         self.recalculate_layout();
     }
-}
-
-// Returns (cell_w, cell_h) for a grid of n windows inside out_w × out_h
-fn grid_cell(n: usize, out_w: u32, out_h: u32) -> (u32, u32) {
-    let cols = (n as f64).sqrt().ceil() as u32;
-    let rows = (n as u32 + cols - 1) / cols;
-    (out_w / cols, out_h / rows)
 }
 
 // Toplevel-mode orchestration
@@ -1353,17 +1447,33 @@ fn main() {
     server.set_address(&args.bind_address);
     server.set_service(&args.bind_port);
 
+    // One connected rtsp client to one open control connection; the count is
+    // read back at /metrics
+    server.connect_client_connected(|_, client| {
+        CLIENTS_RTSP.fetch_add(1, Ordering::Relaxed);
+        client.connect_closed(|_| {
+            CLIENTS_RTSP.fetch_sub(1, Ordering::Relaxed);
+        });
+    });
+
     let factory = RTSPMediaFactory::new();
     factory.set_shared(true);
 
     match args.mode {
         Mode::Output => {
+            // Queues on both sides of the encoder: the live appsrc and the
+            // rtsp server's own appsink each need buffering to meet their
+            // processing deadline, otherwise gst warns and runs at zero
+            // latency, so a single slow frame arrives late
             factory.set_launch(&format!(
                 "appsrc name=mysrc is-live=true do-timestamp=true format=time \
                  caps=video/x-raw,format=BGRx,width=16,height=16,framerate={fps}/1 \
+                 ! queue leaky=downstream max-size-time=200000000 \
+                   max-size-bytes=0 max-size-buffers=0 \
                  ! videoconvert ! video/x-raw,format=I420 \
-                 ! x264enc speed-preset=ultrafast tune=zerolatency \
-                 ! rtph264pay name=pay0 pt=96",
+                 ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max={fps} \
+                 ! queue max-size-time=200000000 max-size-bytes=0 max-size-buffers=0 \
+                 ! rtph264pay name=pay0 pt=96 config-interval=1",
                 fps = framerate()
             ));
             factory.connect_media_configure(move |_, media| {
@@ -1411,12 +1521,22 @@ fn main() {
         match TcpListener::bind(&addr) {
             Ok(listener) => {
                 println!("WebM stream:  http://{addr}/");
+                println!("MKV stream:   http://{addr}/stream.mkv");
                 println!("MJPEG stream: http://{addr}/mjpeg");
                 println!("Snapshot:     http://{addr}/snapshot");
+                println!("Metrics:      http://{addr}/metrics");
                 std::thread::spawn(move || serve_http(listener));
             }
             Err(e) => eprintln!("http: cannot bind {addr}: {e}"),
         }
+    }
+
+    // ssdp makes dlna players list the stream; a byebye goes out on shutdown
+    // so they drop it instead of timing out on the announcement
+    let ssdp_shutdown = Arc::new(AtomicBool::new(false));
+    if args.http_port != 0 && !args.no_dlna {
+        let _ = DLNA_NAME.set(args.dlna_name.clone());
+        dlna::spawn_ssdp(args.http_port, ssdp_shutdown.clone());
     }
 
     let mounts = server.mount_points().expect("mount points");
@@ -1427,6 +1547,13 @@ fn main() {
     let main_loop = glib::MainLoop::new(None, false);
     let mut signals = Signals::new([SIGINT, SIGTERM]).expect("signals");
     let ml = main_loop.clone();
-    std::thread::spawn(move || { if signals.forever().next().is_some() { ml.quit(); } });
+    std::thread::spawn(move || {
+        if signals.forever().next().is_some() {
+            ssdp_shutdown.store(true, Ordering::Relaxed);
+            // One poll interval, so the ssdp thread can send its byebye
+            std::thread::sleep(Duration::from_millis(1200));
+            ml.quit();
+        }
+    });
     main_loop.run();
 }
