@@ -20,8 +20,9 @@ use signal_hook::consts::signal::{SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 use std::os::unix::io::AsFd;
 use std::io::Write as _;
+use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::OnceLock;
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -82,6 +83,9 @@ struct Args {
     /// Port for the http mjpeg stream a browser can display, 0 disables it
     #[arg(long, default_value = "7002")]
     http_port: u16,
+    /// Port the media player relays stream audio to, opus over rtp; 0 disables
+    #[arg(long, env = "STREAM_AUDIO_PORT", default_value = "7005")]
+    audio_port: u16,
     /// Do not announce the stream over ssdp for dlna players
     #[arg(long)]
     no_dlna: bool,
@@ -154,6 +158,113 @@ fn ensure_capture() {
     let slot = frames().clone();
     let shutdown = capture_shutdown().clone();
     std::thread::spawn(move || wayland_capture_loop_output(slot, shutdown));
+}
+
+// The media player relays the current stream's audio here, opus over rtp. One
+// capture thread decodes it to raw pcm; the rtsp pay1 and every webm client
+// read chunks from the queue, padding silence when nothing is playing
+type PcmQueue = Arc<Mutex<VecDeque<Vec<u8>>>>;
+static AUDIO_PCM: OnceLock<PcmQueue> = OnceLock::new();
+static AUDIO_CAPTURE: AtomicBool = AtomicBool::new(false);
+// Set once from Args so the http handlers can reach it; 0 disables audio
+static AUDIO_PORT: AtomicU16 = AtomicU16::new(0);
+
+fn audio_port() -> u16 {
+    AUDIO_PORT.load(Ordering::Relaxed)
+}
+
+// 20 ms of 48 kHz interleaved stereo s16, the opusdec output chunk
+const AUDIO_CHUNK_BYTES: usize = 960 * 2 * 2;
+
+fn audio_pcm() -> &'static PcmQueue {
+    AUDIO_PCM.get_or_init(|| Arc::new(Mutex::new(VecDeque::new())))
+}
+
+fn audio_caps() -> gst::Caps {
+    gst::Caps::builder("audio/x-raw")
+        .field("format", "S16LE")
+        .field("rate", 48_000i32)
+        .field("channels", 2i32)
+        .field("layout", "interleaved")
+        .build()
+}
+
+// One buffered chunk, or silence when the queue is empty
+fn next_audio_chunk() -> Vec<u8> {
+    audio_pcm()
+        .lock()
+        .ok()
+        .and_then(|mut q| q.pop_front())
+        .unwrap_or_else(|| vec![0u8; AUDIO_CHUNK_BYTES])
+}
+
+fn ensure_audio_capture(port: u16) {
+    if port == 0 || AUDIO_CAPTURE.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    std::thread::spawn(move || {
+        let desc = format!(
+            "udpsrc port={port} \
+             caps=application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,payload=97 \
+             ! rtpjitterbuffer latency=200 do-lost=true \
+             ! rtpopusdepay ! opusdec plc=true \
+             ! audioconvert ! audioresample \
+             ! audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved \
+             ! appsink name=asink sync=false max-buffers=64 drop=true"
+        );
+        let pipeline = match gst::parse::launch(&desc) {
+            Ok(e) => e.downcast::<gst::Pipeline>().unwrap(),
+            Err(e) => {
+                eprintln!("audio: relay pipeline: {e}");
+                AUDIO_CAPTURE.store(false, Ordering::SeqCst);
+                return;
+            }
+        };
+        let asink = pipeline
+            .by_name("asink")
+            .unwrap()
+            .downcast::<gst_app::AppSink>()
+            .unwrap();
+        if pipeline.set_state(gst::State::Playing).is_err() {
+            eprintln!("audio: relay would not start");
+            AUDIO_CAPTURE.store(false, Ordering::SeqCst);
+            return;
+        }
+        eprintln!("audio: relay listening on udp/{port}");
+        loop {
+            match asink.try_pull_sample(gst::ClockTime::from_seconds(1)) {
+                Some(sample) => {
+                    if let Some(map) = sample.buffer().and_then(|b| b.map_readable().ok()) {
+                        if let Ok(mut q) = audio_pcm().lock() {
+                            q.push_back(map.as_slice().to_vec());
+                            while q.len() > 64 {
+                                q.pop_front();
+                            }
+                        }
+                    }
+                }
+                None if asink.is_eos() => break,
+                None => {}
+            }
+        }
+        let _ = pipeline.set_state(gst::State::Null);
+        AUDIO_CAPTURE.store(false, Ordering::SeqCst);
+    });
+}
+
+// Feeds an rtsp media's audiosrc: one 20 ms chunk (or silence) every 20 ms
+fn run_audio_output(appsrc: gst_app::AppSrc, port: u16, shutdown: Arc<AtomicBool>) {
+    ensure_audio_capture(port);
+    appsrc.set_caps(Some(&audio_caps()));
+    while !shutdown.load(Ordering::Relaxed) {
+        if appsrc
+            .push_buffer(gst::Buffer::from_slice(next_audio_chunk()))
+            .is_err()
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 // A persistent pipeline: building one per frame would cost more than the encode
@@ -289,7 +400,7 @@ fn handle_http(mut stream: TcpStream) -> std::io::Result<()> {
         }
         "/" | "/webm" => {
             let _guard = ClientGuard::new(&CLIENTS_WEBM);
-            match StreamEncoder::webm() {
+            match StreamEncoder::webm(audio_port()) {
                 Ok(encoder) => stream_chunked(&mut stream, encoder,
                                               "video/webm")?,
                 Err(e) => {
@@ -347,6 +458,9 @@ fn stream_chunked(stream: &mut TcpStream, mut encoder: StreamEncoder,
         "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").as_bytes())?;
 
     let mut idle = 0u32;
+    // Audio chunks are 20 ms; a video frame interval is longer, so carry the
+    // remainder and push as many chunks as fit each turn
+    let mut audio_debt = Duration::ZERO;
     loop {
         let frame = frames().lock().ok().and_then(|f| f.clone());
         match frame {
@@ -364,6 +478,11 @@ fn stream_chunked(stream: &mut TcpStream, mut encoder: StreamEncoder,
                     break;
                 }
             }
+        }
+        audio_debt += frame_interval();
+        while audio_debt >= Duration::from_millis(20) {
+            encoder.push_audio();
+            audio_debt -= Duration::from_millis(20);
         }
         while let Some(chunk) = encoder.pull() {
             write!(stream, "{:x}\r\n", chunk.len())?;
@@ -384,13 +503,16 @@ fn stream_chunked(stream: &mut TcpStream, mut encoder: StreamEncoder,
 // without hls.js. h264 in matroska is the same shape for dlna players
 struct StreamEncoder {
     appsrc: gst_app::AppSrc,
+    audio: Option<gst_app::AppSrc>,
     sink: gst_app::AppSink,
     pipeline: gst::Pipeline,
     caps_set: bool,
 }
 
 impl StreamEncoder {
-    fn webm() -> Result<Self, String> {
+    // vp8 + opus in webm: the browser <video> plays both, and opus is what
+    // scream already muxes for rtsp pay1
+    fn webm(audio_port: u16) -> Result<Self, String> {
         // deadline=1 is vp8's realtime mode; without it the encoder happily
         // spends far longer than a frame interval on a frame
         let enc = gst::ElementFactory::make("vp8enc")
@@ -402,12 +524,13 @@ impl StreamEncoder {
             .property("streamable", true)
             .build().map_err(|e| e.to_string())?;
 
-        Self::build(enc, mux)
+        Self::build(enc, mux, audio_port)
     }
 
     fn matroska_h264() -> Result<Self, String> {
         // The same encode the rtsp stream runs; a short keyframe interval so
-        // a player joining the live stream starts within a couple of seconds
+        // a player joining the live stream starts within a couple of seconds.
+        // Video only: dlna players are fussy about opus in matroska
         let enc = gst::ElementFactory::make("x264enc")
             .property_from_str("speed-preset", "ultrafast")
             .property_from_str("tune", "zerolatency")
@@ -417,10 +540,10 @@ impl StreamEncoder {
             .property("streamable", true)
             .build().map_err(|e| e.to_string())?;
 
-        Self::build(enc, mux)
+        Self::build(enc, mux, 0)
     }
 
-    fn build(enc: gst::Element, mux: gst::Element) -> Result<Self, String> {
+    fn build(enc: gst::Element, mux: gst::Element, audio_port: u16) -> Result<Self, String> {
         let pipeline = gst::Pipeline::new();
         let appsrc = gst_app::AppSrc::builder()
             .is_live(true).do_timestamp(true).format(gst::Format::Time).build();
@@ -428,11 +551,33 @@ impl StreamEncoder {
         let sink = gst_app::AppSink::builder().sync(false).max_buffers(4).drop(false).build();
         pipeline.add_many([appsrc.upcast_ref(), &convert, &enc, &mux, sink.upcast_ref()])
             .map_err(|e| e.to_string())?;
-        gst::Element::link_many([appsrc.upcast_ref(), &convert, &enc, &mux, sink.upcast_ref()])
+        gst::Element::link_many([appsrc.upcast_ref(), &convert, &enc])
             .map_err(|e| e.to_string())?;
+        enc.link(&mux).map_err(|e| e.to_string())?;
+        mux.link(&sink).map_err(|e| e.to_string())?;
+
+        let audio = if audio_port != 0 {
+            ensure_audio_capture(audio_port);
+            let asrc = gst_app::AppSrc::builder()
+                .is_live(true).do_timestamp(true).format(gst::Format::Time)
+                .caps(&audio_caps()).build();
+            let aconv = gst::ElementFactory::make("audioconvert").build().map_err(|e| e.to_string())?;
+            let ares = gst::ElementFactory::make("audioresample").build().map_err(|e| e.to_string())?;
+            let aenc = gst::ElementFactory::make("opusenc")
+                .property("bitrate", 96_000i32).build().map_err(|e| e.to_string())?;
+            pipeline.add_many([asrc.upcast_ref(), &aconv, &ares, &aenc])
+                .map_err(|e| e.to_string())?;
+            gst::Element::link_many([asrc.upcast_ref(), &aconv, &ares, &aenc])
+                .map_err(|e| e.to_string())?;
+            aenc.link(&mux).map_err(|e| e.to_string())?;
+            Some(asrc)
+        } else {
+            None
+        };
+
         pipeline.set_state(gst::State::Playing).map_err(|e| e.to_string())?;
 
-        Ok(StreamEncoder { appsrc, sink, pipeline, caps_set: false })
+        Ok(StreamEncoder { appsrc, audio, sink, pipeline, caps_set: false })
     }
 
     fn push(&mut self, frame: &LatestFrame) -> bool {
@@ -448,6 +593,12 @@ impl StreamEncoder {
         }
 
         self.appsrc.push_buffer(gst::Buffer::from_slice(frame.pixels.clone())).is_ok()
+    }
+
+    fn push_audio(&mut self) {
+        if let Some(src) = &self.audio {
+            let _ = src.push_buffer(gst::Buffer::from_slice(next_audio_chunk()));
+        }
     }
 
     fn pull(&mut self) -> Option<Vec<u8>> {
@@ -1442,6 +1593,7 @@ fn main() {
 
     let args = Args::parse();
     FRAMERATE.store(args.framerate.max(1), Ordering::Relaxed);
+    AUDIO_PORT.store(args.audio_port, Ordering::Relaxed);
 
     let server = RTSPServer::new();
     server.set_address(&args.bind_address);
@@ -1465,6 +1617,19 @@ fn main() {
             // rtsp server's own appsink each need buffering to meet their
             // processing deadline, otherwise gst warns and runs at zero
             // latency, so a single slow frame arrives late
+            // pay1 is a second stream in the same session: the media player's
+            // relayed audio, re-encoded to opus. audiosrc always pushes, so
+            // it is silence when no media view is up
+            let audio_port = args.audio_port;
+            let audio_branch = if audio_port != 0 {
+                " appsrc name=audiosrc is-live=true do-timestamp=true format=time \
+                  caps=audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved \
+                  ! queue ! audioconvert ! audioresample \
+                  ! opusenc bitrate=96000 \
+                  ! queue ! rtpopuspay name=pay1 pt=97"
+            } else {
+                ""
+            };
             factory.set_launch(&format!(
                 "appsrc name=mysrc is-live=true do-timestamp=true format=time \
                  caps=video/x-raw,format=BGRx,width=16,height=16,framerate={fps}/1 \
@@ -1473,8 +1638,8 @@ fn main() {
                  ! videoconvert ! video/x-raw,format=I420 \
                  ! x264enc speed-preset=ultrafast tune=zerolatency key-int-max={fps} \
                  ! queue max-size-time=200000000 max-size-bytes=0 max-size-buffers=0 \
-                 ! rtph264pay name=pay0 pt=96 config-interval=1",
-                fps = framerate()
+                 ! rtph264pay name=pay0 pt=96 config-interval=1{audio}",
+                fps = framerate(), audio = audio_branch
             ));
             factory.connect_media_configure(move |_, media| {
                 let element = media.element();
@@ -1485,6 +1650,11 @@ fn main() {
                     let sd = shutdown.clone();
                     move |_| sd.store(true, Ordering::Relaxed)
                 });
+                if let Some(a) = bin.by_name("audiosrc") {
+                    let audiosrc = a.downcast::<gst_app::AppSrc>().unwrap();
+                    let sd = shutdown.clone();
+                    std::thread::spawn(move || run_audio_output(audiosrc, audio_port, sd));
+                }
                 std::thread::spawn(move || run_capture_output(appsrc, shutdown));
             });
         }
