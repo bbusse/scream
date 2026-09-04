@@ -1,20 +1,20 @@
 // The tiny HTTP request reader shared by the stream server and the DLNA
 // endpoints. Only what is needed to route a request: a start line, folded
-// header names, and a length-bounded body.
+// header names, and a length-bounded body
 
 use std::io::BufRead;
 
 pub struct Request {
     pub method: String,
     pub target: String,
-    // Header names are lowercased; values keep their case.
+    // Header names are lowercased, values keep their case
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
 }
 
 impl Request {
     // Reads one request off a buffered stream. Returns None on a malformed
-    // start line or a truncated body, which the caller answers with 400.
+    // start line or a truncated body, which the caller answers with 400
     pub fn parse<R: BufRead>(reader: &mut R) -> Option<Request> {
         let mut line = String::new();
         reader.read_line(&mut line).ok()?;
@@ -49,7 +49,7 @@ impl Request {
         Some(Request { method, target, headers, body })
     }
 
-    // The request target with any query string stripped.
+    // The request target with any query string stripped
     pub fn path(&self) -> &str {
         self.target.split('?').next().unwrap_or("/")
     }

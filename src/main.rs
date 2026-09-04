@@ -1,4 +1,4 @@
-// scream - Screen Stream
+// scream: Screen Stream
 //
 // SPDX-License-Identifier: BSD-3-Clause
 // Copyright (c) 2026 Björn Busse
@@ -89,21 +89,94 @@ struct Args {
     /// Do not announce the stream over ssdp for dlna players
     #[arg(long)]
     no_dlna: bool,
-    /// The name dlna players list the stream under
-    #[arg(long, default_value = "ISS Display")]
-    dlna_name: String,
+    /// What clients call the stream: the RTSP SDP session name, the WebM and
+    /// Matroska container title, and the name dlna players list it under
+    #[arg(long, env = "STREAM_TITLE", default_value = "ISS Display")]
+    stream_title: String,
+    /// Base URL clients should reach this stream at, e.g.
+    /// http://192.168.1.10:7002. Overrides the address scream autodetects for
+    /// the ssdp LOCATION and the DLNA stream url; needed behind a NAT or in a
+    /// container where the published port differs from the internal one
+    #[arg(long, env = "STREAM_ADVERTISE_URL")]
+    advertise_url: Option<String>,
+    /// Tunnel ssdp over one unicast udp connection to a `scream
+    /// --ssdp-relay-server` at this host:port instead of speaking multicast
+    /// directly; use when multicast cannot leave the container/VM, e.g.
+    /// host.containers.internal:1901
+    #[arg(long, env = "STREAM_SSDP_RELAY")]
+    ssdp_relay: Option<String>,
+    /// Run as the ssdp relay: bridge the LAN multicast group to scream
+    /// instances that connect over --ssdp-relay. Ignores all capture options
+    /// and runs until killed
+    #[arg(long)]
+    ssdp_relay_server: bool,
+    /// Address the relay accepts scream instances on (--ssdp-relay-server)
+    #[arg(long, default_value = "0.0.0.0:1901")]
+    ssdp_relay_listen: String,
+    /// Local IPv4 address to join the ssdp group on (--ssdp-relay-server);
+    /// 0.0.0.0 uses the default-route interface
+    #[arg(long, default_value = "0.0.0.0")]
+    ssdp_relay_iface: String,
+    /// UDP port the relay listens for the ssdp group on (--ssdp-relay-server);
+    /// 1900 is the standard and what clients send M-SEARCH to
+    #[arg(long, default_value = "1900")]
+    ssdp_relay_lan_port: u16,
 }
 
-static DLNA_NAME: OnceLock<String> = OnceLock::new();
+static STREAM_TITLE: OnceLock<String> = OnceLock::new();
 
-fn dlna_name() -> &'static str {
-    DLNA_NAME.get().map(|s| s.as_str()).unwrap_or("ISS Display")
+fn stream_title() -> &'static str {
+    STREAM_TITLE.get().map(|s| s.as_str()).unwrap_or("ISS Display")
 }
 
 static FRAMERATE: AtomicU32 = AtomicU32::new(30);
 
 fn framerate() -> u32 {
     FRAMERATE.load(Ordering::Relaxed)
+}
+
+// gst-rtsp-server hardcodes the SDP session name as "Session streamed with
+// GStreamer" in its client class. A RTSPMedia subclass whose setup_sdp runs
+// after the default one rewrites the s= and i= lines with our own title. The
+// factory is told to make these instead of plain RTSPMedia via set_media_gtype
+mod titled_media {
+    use gstreamer_rtsp_server::subclass::prelude::*;
+
+    mod imp {
+        use super::*;
+        use gstreamer as gst;
+
+        #[derive(Default)]
+        pub struct TitledMedia;
+
+        #[glib::object_subclass]
+        impl ObjectSubclass for TitledMedia {
+            const NAME: &'static str = "ScreamTitledMedia";
+            type Type = super::TitledMedia;
+            type ParentType = gstreamer_rtsp_server::RTSPMedia;
+        }
+
+        impl ObjectImpl for TitledMedia {}
+
+        impl RTSPMediaImpl for TitledMedia {
+            fn setup_sdp(
+                &self,
+                sdp: &mut gstreamer_sdp::SDPMessageRef,
+                info: &gstreamer_rtsp_server::subclass::SDPInfo,
+            ) -> Result<(), gst::LoggableError> {
+                self.parent_setup_sdp(sdp, info)?;
+                let title = crate::stream_title();
+                sdp.set_session_name(title);
+                sdp.set_information(title);
+                Ok(())
+            }
+        }
+    }
+
+    glib::wrapper! {
+        pub struct TitledMedia(ObjectSubclass<imp::TitledMedia>)
+            @extends gstreamer_rtsp_server::RTSPMedia;
+    }
 }
 
 fn frame_interval() -> Duration {
@@ -135,7 +208,7 @@ struct LatestFrame {
 
 type FrameSlot = Arc<Mutex<Option<LatestFrame>>>;
 
-// Capturing an output costs a few percent of a core; encoding it is what costs
+// Capturing an output costs a few percent of a core, encoding it is what costs
 // real time. So one capture feeds every consumer and the encoders start only
 // when something asks for them: h264 when an rtsp client connects, jpeg while
 // an http client is reading
@@ -161,12 +234,12 @@ fn ensure_capture() {
 }
 
 // The media player relays the current stream's audio here, opus over rtp. One
-// capture thread decodes it to raw pcm; the rtsp pay1 and every webm client
+// capture thread decodes it to raw pcm, the rtsp pay1 and every webm client
 // read chunks from the queue, padding silence when nothing is playing
 type PcmQueue = Arc<Mutex<VecDeque<Vec<u8>>>>;
 static AUDIO_PCM: OnceLock<PcmQueue> = OnceLock::new();
 static AUDIO_CAPTURE: AtomicBool = AtomicBool::new(false);
-// Set once from Args so the http handlers can reach it; 0 disables audio
+// Set once from Args so the http handlers can reach it, 0 disables audio
 static AUDIO_PORT: AtomicU16 = AtomicU16::new(0);
 
 fn audio_port() -> u16 {
@@ -206,7 +279,7 @@ fn ensure_audio_capture(port: u16) {
         let desc = format!(
             "udpsrc port={port} \
              caps=application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,payload=97 \
-             ! rtpjitterbuffer latency=200 do-lost=true \
+             ! rtpjitterbuffer latency=400 mode=none do-lost=true \
              ! rtpopusdepay ! opusdec plc=true \
              ! audioconvert ! audioresample \
              ! audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved \
@@ -252,20 +325,6 @@ fn ensure_audio_capture(port: u16) {
     });
 }
 
-// Feeds an rtsp media's audiosrc: one 20 ms chunk (or silence) every 20 ms
-fn run_audio_output(appsrc: gst_app::AppSrc, port: u16, shutdown: Arc<AtomicBool>) {
-    ensure_audio_capture(port);
-    appsrc.set_caps(Some(&audio_caps()));
-    while !shutdown.load(Ordering::Relaxed) {
-        if appsrc
-            .push_buffer(gst::Buffer::from_slice(next_audio_chunk()))
-            .is_err()
-        {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(20));
-    }
-}
 
 // A persistent pipeline: building one per frame would cost more than the encode
 struct JpegEncoder {
@@ -317,12 +376,31 @@ impl Drop for JpegEncoder {
     }
 }
 
+// A finite response (/metrics, /snapshot) leaves the connection open for the
+// next request, so a scrape from Prometheus or the controller every few
+// seconds reuses one socket instead of leaving a TIME_WAIT behind each time.
+// Streaming responses and errors still take the connection down
+enum HttpNext {
+    KeepAlive,
+    Close,
+}
+
 fn serve_http(listener: TcpListener) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         std::thread::spawn(move || {
-            if let Err(e) = handle_http(stream) {
-                log_http(&format!("client gone: {e}"));
+            // Stops an idle kept-alive connection from pinning its thread
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
+            let mut stream = stream;
+            loop {
+                match handle_http(&mut stream) {
+                    Ok(HttpNext::KeepAlive) => continue,
+                    Ok(HttpNext::Close) => break,
+                    Err(e) => {
+                        log_http(&format!("client gone: {e}"));
+                        break;
+                    }
+                }
             }
         });
     }
@@ -343,38 +421,41 @@ fn jpeg_encoder(stream: &mut TcpStream) -> std::io::Result<Option<JpegEncoder>> 
     }
 }
 
-fn handle_http(mut stream: TcpStream) -> std::io::Result<()> {
-    let request = match Request::parse(&mut std::io::BufReader::new(&stream)) {
+fn handle_http(stream: &mut TcpStream) -> std::io::Result<HttpNext> {
+    // Bound in a let so the BufReader temporary is dropped before the arms
+    // below borrow the stream to write
+    let parsed = Request::parse(&mut std::io::BufReader::new(&*stream));
+    let request = match parsed {
         Some(r) => r,
-        None => {
-            stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")?;
-            return Ok(());
-        }
+        // A clean close between requests, or the read timeout firing, both
+        // land here, there is nothing to reply to
+        None => return Ok(HttpNext::Close),
     };
 
     let path = request.path().to_string();
 
     // The dlna endpoints answer descriptions and SOAP, not video: they must
     // not spin up capture or an encoder
-    if dlna::handle_request(&mut stream, &request.method, &path,
-                            &request.headers, &request.body, dlna_name())? {
-        return Ok(());
+    if dlna::handle_request(stream, &request.method, &path,
+                            &request.headers, &request.body, stream_title())? {
+        return Ok(HttpNext::Close);
     }
 
     if request.method != "GET" {
-        stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")?;
-        return Ok(());
+        stream.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
+        return Ok(HttpNext::Close);
     }
 
     // Answered without capture or an encoder, so a scrape never wakes the
-    // pipeline
+    // pipeline. Content-Length and no Connection: close, so a client that
+    // scrapes on a timer keeps the one socket
     if path == "/metrics" {
         let body = metrics::metrics_body();
         stream.write_all(format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
             body.len()).as_bytes())?;
         stream.write_all(body.as_bytes())?;
-        return Ok(());
+        return Ok(HttpNext::KeepAlive);
     }
 
     ensure_capture();
@@ -382,26 +463,26 @@ fn handle_http(mut stream: TcpStream) -> std::io::Result<()> {
         "/snapshot" | "/screenshot" => {
             SNAPSHOTS_TOTAL.fetch_add(1, Ordering::Relaxed);
             let _guard = ClientGuard::new(&CLIENTS_SNAPSHOT);
-            let Some(mut encoder) = jpeg_encoder(&mut stream)? else {
-                return Ok(());
+            let Some(mut encoder) = jpeg_encoder(stream)? else {
+                return Ok(HttpNext::Close);
             };
             // One frame, for a save button or anything expecting a still
             for _ in 0..40 {
                 if let Some(jpeg) = latest_jpeg(&mut encoder) {
                     stream.write_all(format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nContent-Length: {}\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
                         jpeg.len()).as_bytes())?;
                     stream.write_all(&jpeg)?;
-                    return Ok(());
+                    return Ok(HttpNext::KeepAlive);
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\n\r\n")?;
+            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
         }
         "/" | "/webm" => {
             let _guard = ClientGuard::new(&CLIENTS_WEBM);
             match StreamEncoder::webm(audio_port()) {
-                Ok(encoder) => stream_chunked(&mut stream, encoder,
+                Ok(encoder) => stream_chunked(stream, encoder,
                                               "video/webm")?,
                 Err(e) => {
                     log_http(&format!("no webm encoder: {e}"));
@@ -414,7 +495,7 @@ fn handle_http(mut stream: TcpStream) -> std::io::Result<()> {
         "/stream.mkv" => {
             let _guard = ClientGuard::new(&CLIENTS_MKV);
             match StreamEncoder::matroska_h264() {
-                Ok(encoder) => stream_chunked(&mut stream, encoder,
+                Ok(encoder) => stream_chunked(stream, encoder,
                                               "video/x-matroska")?,
                 Err(e) => {
                     log_http(&format!("no matroska encoder: {e}"));
@@ -424,8 +505,8 @@ fn handle_http(mut stream: TcpStream) -> std::io::Result<()> {
         }
         "/mjpeg" => {
             let _guard = ClientGuard::new(&CLIENTS_MJPEG);
-            let Some(mut encoder) = jpeg_encoder(&mut stream)? else {
-                return Ok(());
+            let Some(mut encoder) = jpeg_encoder(stream)? else {
+                return Ok(HttpNext::Close);
             };
             stream.write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=screamframe\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")?;
@@ -443,11 +524,11 @@ fn handle_http(mut stream: TcpStream) -> std::io::Result<()> {
             }
         }
         _ => {
-            stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")?;
+            stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")?;
         }
     }
 
-    Ok(())
+    Ok(HttpNext::Close)
 }
 
 // Chunked, so the response never ends and the client keeps playing what
@@ -458,7 +539,7 @@ fn stream_chunked(stream: &mut TcpStream, mut encoder: StreamEncoder,
         "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").as_bytes())?;
 
     let mut idle = 0u32;
-    // Audio chunks are 20 ms; a video frame interval is longer, so carry the
+    // Audio chunks are 20 ms, a video frame interval is longer, so carry the
     // remainder and push as many chunks as fit each turn
     let mut audio_debt = Duration::ZERO;
     loop {
@@ -513,7 +594,7 @@ impl StreamEncoder {
     // vp8 + opus in webm: the browser <video> plays both, and opus is what
     // scream already muxes for rtsp pay1
     fn webm(audio_port: u16) -> Result<Self, String> {
-        // deadline=1 is vp8's realtime mode; without it the encoder happily
+        // deadline=1 is vp8's realtime mode, without it the encoder happily
         // spends far longer than a frame interval on a frame
         let enc = gst::ElementFactory::make("vp8enc")
             .property("deadline", 1i64)
@@ -528,7 +609,7 @@ impl StreamEncoder {
     }
 
     fn matroska_h264() -> Result<Self, String> {
-        // The same encode the rtsp stream runs; a short keyframe interval so
+        // The same encode the rtsp stream runs, a short keyframe interval so
         // a player joining the live stream starts within a couple of seconds.
         // Video only: dlna players are fussy about opus in matroska
         let enc = gst::ElementFactory::make("x264enc")
@@ -544,6 +625,11 @@ impl StreamEncoder {
     }
 
     fn build(enc: gst::Element, mux: gst::Element, audio_port: u16) -> Result<Self, String> {
+        // The container title a browser or dlna player shows for the stream
+        if let Some(ts) = mux.dynamic_cast_ref::<gst::TagSetter>() {
+            ts.add_tag::<gst::tags::Title>(&stream_title(), gst::TagMergeMode::Replace);
+        }
+
         let pipeline = gst::Pipeline::new();
         let appsrc = gst_app::AppSrc::builder()
             .is_live(true).do_timestamp(true).format(gst::Format::Time).build();
@@ -930,7 +1016,7 @@ impl Dispatch<ExtForeignToplevelHandleV1, ()> for CaptureState {
             match event {
                 ext_foreign_toplevel_handle_v1::Event::Identifier { identifier } => t.identifier = identifier,
                 ext_foreign_toplevel_handle_v1::Event::Done => t.done = true,
-                // Window closed while we were still waiting; treat as session_stopped
+                // Window closed while we were still waiting, treat as session_stopped
                 ext_foreign_toplevel_handle_v1::Event::Closed => {
                     state.session_stopped = true;
                 }
@@ -1049,7 +1135,7 @@ fn wayland_capture_loop_toplevel(
         return;
     };
 
-    // Collect the initial toplevel list; wait for Done events
+    // Collect the initial toplevel list, wait for Done events
     if eq.roundtrip(&mut state).is_err() { return; }
     if eq.roundtrip(&mut state).is_err() { return; }
 
@@ -1153,12 +1239,12 @@ struct CompositorPipeline {
 
 impl CompositorPipeline {
     // Build the skeleton pipeline with a test-card background source and the fixed
-    // downstream chain; window streams are added dynamically via add_stream
+    // downstream chain, window streams are added dynamically via add_stream
     fn new(out_w: u32, out_h: u32) -> Self {
         let pipeline = gst::Pipeline::new();
 
         // SMPTE test card ensures the compositor always has data to output,
-        // even before any window streams are attached; also useful for
+        // even before any window streams are attached, also useful for
         // verifying the RTSP stream is alive before any toplevels appear
         let bg_src = gst::ElementFactory::make("videotestsrc")
             .property_from_str("pattern", "smpte")
@@ -1564,10 +1650,20 @@ fn wayland_capture_loop_output(latest_frame: Arc<Mutex<Option<LatestFrame>>>, sh
     }
 }
 
-fn run_capture_output(appsrc: gst_app::AppSrc, shutdown: Arc<AtomicBool>) {
+// Feeds mysrc and audiosrc from one loop and one sleep, pacing audio off
+// audio_debt the way stream_chunked paces /webm, so the two cannot drift
+// apart the way two independently sleeping threads did
+fn run_output(video: gst_app::AppSrc, audio: Option<(gst_app::AppSrc, u16)>,
+              shutdown: Arc<AtomicBool>) {
     ensure_capture();
     let latest_frame = frames().clone();
     let mut caps_set = false;
+    if let Some((audiosrc, port)) = &audio {
+        ensure_audio_capture(*port);
+        audiosrc.set_caps(Some(&audio_caps()));
+    }
+
+    let mut audio_debt = Duration::ZERO;
     while !shutdown.load(Ordering::Relaxed) {
         if let Some(frame) = latest_frame.lock().unwrap().clone() {
             if !caps_set {
@@ -1577,29 +1673,60 @@ fn run_capture_output(appsrc: gst_app::AppSrc, shutdown: Arc<AtomicBool>) {
                     .field("height", frame.height as i32)
                     .field("framerate", gst::Fraction::new(framerate() as i32, 1))
                     .build();
-                appsrc.set_caps(Some(&caps));
+                video.set_caps(Some(&caps));
                 caps_set = true;
             }
-            let buf = gst::Buffer::from_slice(frame.pixels);
-            if appsrc.push_buffer(buf).is_err() { return; }
+            if video.push_buffer(gst::Buffer::from_slice(frame.pixels)).is_err() {
+                return;
+            }
         }
+
+        if let Some((audiosrc, _)) = &audio {
+            audio_debt += frame_interval();
+            while audio_debt >= Duration::from_millis(20) {
+                if audiosrc.push_buffer(gst::Buffer::from_slice(next_audio_chunk())).is_err() {
+                    return;
+                }
+                audio_debt -= Duration::from_millis(20);
+            }
+        }
+
         std::thread::sleep(frame_interval());
     }
 }
 
 fn main() {
+    let args = Args::parse();
+
+    // The relay is pure sockets: no compositor, no gstreamer, no rtsp server.
+    // Handle it before any of that is touched so it runs anywhere scream builds
+    if args.ssdp_relay_server {
+        let iface: std::net::Ipv4Addr = args.ssdp_relay_iface.parse()
+            .unwrap_or_else(|_| {
+                eprintln!("--ssdp-relay-iface must be an IPv4 address");
+                std::process::exit(2);
+            });
+        println!("ssdp-relay: starting");
+        if let Err(e) = dlna::run_relay(&args.ssdp_relay_listen, iface, args.ssdp_relay_lan_port) {
+            eprintln!("ssdp-relay: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+
     if std::env::var("GST_DEBUG").is_err() { std::env::set_var("GST_DEBUG", "2"); }
     gst::init().expect("GStreamer init");
 
-    let args = Args::parse();
     FRAMERATE.store(args.framerate.max(1), Ordering::Relaxed);
     AUDIO_PORT.store(args.audio_port, Ordering::Relaxed);
+    let _ = STREAM_TITLE.set(args.stream_title.clone());
+    dlna::set_advertise_url(args.advertise_url.clone());
 
     let server = RTSPServer::new();
     server.set_address(&args.bind_address);
     server.set_service(&args.bind_port);
 
-    // One connected rtsp client to one open control connection; the count is
+    // One connected rtsp client to one open control connection, the count is
     // read back at /metrics
     server.connect_client_connected(|_, client| {
         CLIENTS_RTSP.fetch_add(1, Ordering::Relaxed);
@@ -1610,6 +1737,7 @@ fn main() {
 
     let factory = RTSPMediaFactory::new();
     factory.set_shared(true);
+    factory.set_media_gtype(titled_media::TitledMedia::static_type());
 
     match args.mode {
         Mode::Output => {
@@ -1650,17 +1778,14 @@ fn main() {
                     let sd = shutdown.clone();
                     move |_| sd.store(true, Ordering::Relaxed)
                 });
-                if let Some(a) = bin.by_name("audiosrc") {
-                    let audiosrc = a.downcast::<gst_app::AppSrc>().unwrap();
-                    let sd = shutdown.clone();
-                    std::thread::spawn(move || run_audio_output(audiosrc, audio_port, sd));
-                }
-                std::thread::spawn(move || run_capture_output(appsrc, shutdown));
+                let audio = bin.by_name("audiosrc")
+                    .map(|a| (a.downcast::<gst_app::AppSrc>().unwrap(), audio_port));
+                std::thread::spawn(move || run_output(appsrc, audio, shutdown));
             });
         }
 
         Mode::Window => {
-            // Explicit CLI dimensions take priority; fall back to querying wl_output
+            // Explicit CLI dimensions take priority, fall back to querying wl_output
             let dynamic_size = args.width.is_none() || args.height.is_none();
             let (default_w, default_h) = args.width.zip(args.height)
                 .or_else(|| query_output_size())
@@ -1669,7 +1794,7 @@ fn main() {
                     (1920, 1080)
                 });
 
-            // Placeholder launch string; the real pipeline is injected via take_pipeline
+            // Placeholder launch string, the real pipeline is injected via take_pipeline
             factory.set_launch(&format!(
                 "videotestsrc ! video/x-raw,format=I420,width=16,height=16,framerate={fps}/1 \
                  ! x264enc speed-preset=ultrafast ! rtph264pay name=pay0 pt=96",
@@ -1701,12 +1826,18 @@ fn main() {
         }
     }
 
-    // ssdp makes dlna players list the stream; a byebye goes out on shutdown
+    // ssdp makes dlna players list the stream, a byebye goes out on shutdown
     // so they drop it instead of timing out on the announcement
     let ssdp_shutdown = Arc::new(AtomicBool::new(false));
     if args.http_port != 0 && !args.no_dlna {
-        let _ = DLNA_NAME.set(args.dlna_name.clone());
-        dlna::spawn_ssdp(args.http_port, ssdp_shutdown.clone());
+        dlna::spawn_ssdp(
+            dlna::SsdpConfig {
+                http_port: args.http_port,
+                advertise: args.advertise_url.clone(),
+                relay: args.ssdp_relay.clone(),
+            },
+            ssdp_shutdown.clone(),
+        );
     }
 
     let mounts = server.mount_points().expect("mount points");

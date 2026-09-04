@@ -1,6 +1,6 @@
 // Window mode tiles every captured toplevel into an equal grid cell on the
 // compositor canvas. The grid is as square as it can be: ceil(sqrt(n)) columns,
-// then as many rows as that needs.
+// then as many rows as that needs
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Grid {
@@ -18,7 +18,7 @@ impl Grid {
         Grid { cols, rows, cell_w: out_w / cols, cell_h: out_h / rows }
     }
 
-    // Top-left corner of cell i, filling rows left to right.
+    // Top-left corner of cell i, filling rows left to right
     pub fn cell_origin(&self, i: usize) -> (u32, u32) {
         let col = i as u32 % self.cols;
         let row = i as u32 / self.cols;

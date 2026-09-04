@@ -1,6 +1,6 @@
 // Subscriber counts per stream type, exposed at GET /metrics. Each streaming
-// handler holds a ClientGuard for as long as its connection is open; the rtsp
-// count is kept by the server's client-connected / closed signals.
+// handler holds a ClientGuard for as long as its connection is open, the rtsp
+// count is kept by the server's client-connected / closed signals
 
 use std::sync::atomic::{AtomicI64, Ordering};
 
@@ -26,7 +26,7 @@ impl Drop for ClientGuard {
     }
 }
 
-// The Prometheus text exposition for the current counter values.
+// The Prometheus text exposition for the current counter values
 pub fn metrics_body() -> String {
     render(
         CLIENTS_WEBM.load(Ordering::Relaxed),
@@ -39,7 +39,7 @@ pub fn metrics_body() -> String {
 }
 
 // The formatting on its own, so a test can pin the exposition shape without
-// touching process-global state.
+// touching process-global state
 fn render(webm: i64, mjpeg: i64, mkv: i64, snapshot: i64, rtsp: i64,
           snapshots_total: i64) -> String {
     format!(

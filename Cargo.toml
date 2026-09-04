@@ -7,6 +7,7 @@ edition = "2021"
 gstreamer = "0.25"
 gstreamer-app = "0.25"
 gstreamer-rtsp-server = "0.25"
+gstreamer-sdp = "0.25"
 glib = "0.22"
 clap = { version = "4.4", features = ["derive", "env"] }
 signal-hook = "0.3"
@@ -14,3 +15,4 @@ memmap2 = "0.9"
 tempfile = "3"
 wayland-client = "0.31"
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+socket2 = { version = "0.6.5", features = ["all"] }
