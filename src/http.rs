@@ -2,7 +2,17 @@
 // endpoints. Only what is needed to route a request: a start line, folded
 // header names, and a length-bounded body
 
-use std::io::BufRead;
+use std::io::{BufRead, Read};
+
+// A line longer than this is not a request, it is someone filling memory
+const MAX_LINE: u64 = 8192;
+
+// One line including its newline, None at end of stream or past MAX_LINE
+fn read_line<R: BufRead>(reader: &mut R) -> Option<String> {
+    let mut line = String::new();
+    (&mut *reader).take(MAX_LINE).read_line(&mut line).ok()?;
+    line.ends_with('\n').then_some(line)
+}
 
 pub struct Request {
     pub method: String,
@@ -14,18 +24,17 @@ pub struct Request {
 
 impl Request {
     // Reads one request off a buffered stream. Returns None on a malformed
-    // start line or a truncated body, which the caller answers with 400
+    // start line, an overlong line or a truncated body, which the caller
+    // answers with 400 or by closing
     pub fn parse<R: BufRead>(reader: &mut R) -> Option<Request> {
-        let mut line = String::new();
-        reader.read_line(&mut line).ok()?;
+        let line = read_line(reader)?;
         let mut parts = line.split_whitespace();
         let method = parts.next()?.to_string();
         let target = parts.next()?.to_string();
 
         let mut headers = Vec::new();
         loop {
-            let mut header = String::new();
-            reader.read_line(&mut header).ok()?;
+            let header = read_line(reader)?;
             let header = header.trim_end();
             if header.is_empty() {
                 break;
@@ -44,6 +53,16 @@ impl Request {
         let mut body = vec![0u8; length.min(65536)];
         if !body.is_empty() {
             reader.read_exact(&mut body).ok()?;
+        }
+        // A body longer than the cap is kept for framing, not for content:
+        // the rest still has to come off the wire or it corrupts the next
+        // request on a kept-alive connection
+        let mut discard = [0u8; 4096];
+        let mut remaining = length - body.len();
+        while remaining > 0 {
+            let n = remaining.min(discard.len());
+            reader.read_exact(&mut discard[..n]).ok()?;
+            remaining -= n;
         }
 
         Some(Request { method, target, headers, body })
@@ -94,5 +113,11 @@ mod tests {
     #[test]
     fn rejects_an_empty_start_line() {
         assert!(parse("\r\n").is_none());
+    }
+
+    #[test]
+    fn rejects_an_overlong_header_line() {
+        let raw = format!("GET / HTTP/1.1\r\nX: {}\r\n\r\n", "a".repeat(20_000));
+        assert!(parse(&raw).is_none());
     }
 }

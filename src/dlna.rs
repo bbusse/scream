@@ -45,7 +45,10 @@ const PROTOCOL_INFO: &str = "http-get:*:video/x-matroska:\
 static ADVERTISE_URL: OnceLock<Option<String>> = OnceLock::new();
 
 pub fn set_advertise_url(url: Option<String>) {
-    let _ = ADVERTISE_URL.set(url.map(|u| u.trim_end_matches('/').to_string()));
+    let _ = ADVERTISE_URL.set(url.map(|u| {
+        let u = u.trim_end_matches('/');
+        if u.contains("://") { u.to_string() } else { format!("http://{u}") }
+    }));
 }
 
 fn advertise_url() -> Option<&'static str> {
@@ -135,14 +138,20 @@ fn bind_ssdp_port(port: u16) -> io::Result<UdpSocket> {
     Ok(sock.into())
 }
 
+// The advertised base url if the operator set one, otherwise whatever fallback
+// the caller computes. Lazy, so a caller with a cheap advertised url skips the
+// work of finding its own address
+fn base_url_or(fallback: impl FnOnce() -> Option<String>) -> Option<String> {
+    match advertise_url() {
+        Some(base) => Some(base.to_string()),
+        None => fallback(),
+    }
+}
+
 // Base url to hand a client, either the operator-provided one or, toward a
 // given peer, whatever local address routes there
 fn client_base_url(http_port: u16, toward: SocketAddr) -> Option<String> {
-    if let Some(base) = advertise_url() {
-        return Some(base.to_string());
-    }
-    let ip = address_toward(toward)?;
-    Some(format!("http://{ip}:{http_port}"))
+    base_url_or(|| Some(format!("http://{}:{http_port}", address_toward(toward)?)))
 }
 
 fn location(http_port: u16, toward: SocketAddr) -> Option<String> {
@@ -223,20 +232,20 @@ impl SsdpIo for MulticastIo {
 }
 
 // tunnel frame: 4-byte IPv4 + 2-byte port, big-endian, then the datagram.
-// scream->relay the address is the destination, relay->scream it is the
+// From scream, the address is the destination, from the relay, it is the
 // source peer. A zero-length payload is a keepalive that only refreshes the
-// relay's idea of where to reach this scream (and holds a NAT mapping open)
-fn encode_frame(addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
+// relay's idea of where to reach this scream (and holds a NAT mapping open).
+// ssdp here is IPv4 only, the group and every socket, so an IPv6 address is
+// refused rather than encoded as zeros
+fn encode_frame(addr: SocketAddr, payload: &[u8]) -> io::Result<Vec<u8>> {
+    let SocketAddr::V4(addr) = addr else {
+        return Err(io::Error::new(io::ErrorKind::Unsupported, "ipv6 peer"));
+    };
     let mut out = Vec::with_capacity(payload.len() + 6);
-    match addr {
-        SocketAddr::V4(a) => {
-            out.extend_from_slice(&a.ip().octets());
-            out.extend_from_slice(&a.port().to_be_bytes());
-        }
-        SocketAddr::V6(_) => out.extend_from_slice(&[0u8; 6]),
-    }
+    out.extend_from_slice(&addr.ip().octets());
+    out.extend_from_slice(&addr.port().to_be_bytes());
     out.extend_from_slice(payload);
-    out
+    Ok(out)
 }
 
 fn decode_frame(buf: &[u8]) -> Option<(SocketAddr, &[u8])> {
@@ -255,21 +264,28 @@ pub struct TunnelIo {
 }
 
 impl TunnelIo {
-    pub fn connect(relay: &str) -> io::Result<Self> {
+    pub fn connect(relay: &str, shutdown: Arc<AtomicBool>) -> io::Result<Self> {
         let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
         sock.connect(relay)?;
         sock.set_read_timeout(Some(Duration::from_secs(1)))?;
 
         // Announce ourselves and keep the relay's return path (and any NAT in
-        // between) alive while the loop is quiet
+        // between) alive while the loop is quiet. Polls shutdown rather than
+        // sleeping the whole 15s so the thread ends with ssdp_loop instead of
+        // outliving it until the process exits
         let keepalive = sock.try_clone()?;
         std::thread::spawn(move || {
-            let ping = encode_frame(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), &[]);
-            loop {
+            let ping = encode_frame(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), &[]).unwrap();
+            while !shutdown.load(Ordering::Relaxed) {
                 if keepalive.send(&ping).is_err() {
                     return;
                 }
-                std::thread::sleep(Duration::from_secs(15));
+                for _ in 0..30 {
+                    if shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
             }
         });
 
@@ -279,7 +295,7 @@ impl TunnelIo {
 
 impl SsdpIo for TunnelIo {
     fn send_to(&self, buf: &[u8], dst: SocketAddr) -> io::Result<()> {
-        self.sock.send(&encode_frame(dst, buf)).map(|_| ())
+        self.sock.send(&encode_frame(dst, buf)?).map(|_| ())
     }
     fn recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         let mut frame = [0u8; 4096];
@@ -303,11 +319,11 @@ pub struct SsdpConfig {
     pub relay: Option<String>,
 }
 
-fn build_io(cfg: &SsdpConfig) -> io::Result<Box<dyn SsdpIo>> {
+fn build_io(cfg: &SsdpConfig, shutdown: Arc<AtomicBool>) -> io::Result<Box<dyn SsdpIo>> {
     match &cfg.relay {
         Some(addr) => {
             println!("SSDP: tunnelling to relay {addr}");
-            Ok(Box::new(TunnelIo::connect(addr)?))
+            Ok(Box::new(TunnelIo::connect(addr, shutdown)?))
         }
         None => Ok(Box::new(MulticastIo::bind()?)),
     }
@@ -316,7 +332,7 @@ fn build_io(cfg: &SsdpConfig) -> io::Result<Box<dyn SsdpIo>> {
 pub fn spawn_ssdp(cfg: SsdpConfig, shutdown: Arc<AtomicBool>) {
     set_advertise_url(cfg.advertise.clone());
     std::thread::spawn(move || {
-        let io = match build_io(&cfg) {
+        let io = match build_io(&cfg, shutdown.clone()) {
             Ok(io) => io,
             Err(e) => {
                 eprintln!("ssdp: {e}");
@@ -376,18 +392,24 @@ pub fn run_relay(listen: &str, iface: Ipv4Addr, lan_port: u16) -> io::Result<()>
         tun.local_addr()?,
     );
 
-    // scream instances that have spoken to us recently
+    // scream instances that have spoken to us recently, forgotten after this
+    const STALE: Duration = Duration::from_secs(120);
     let clients: Arc<Mutex<HashMap<SocketAddr, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    // scream -> LAN
+    // scream to LAN. Ends with the socket's first real error, which the LAN
+    // loop below picks up on its next timeout
     let up = {
         let clients = clients.clone();
         let lan = lan.try_clone()?;
         let tun = tun.try_clone()?;
-        std::thread::spawn(move || {
+        std::thread::spawn(move || -> io::Error {
             let mut frame = [0u8; 4096];
             loop {
-                let Ok((n, from)) = tun.recv_from(&mut frame) else { continue };
+                let (n, from) = match tun.recv_from(&mut frame) {
+                    Ok(received) => received,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return e,
+                };
                 let Some((dst, payload)) = decode_frame(&frame[..n]) else { continue };
                 clients.lock().unwrap().insert(from, Instant::now());
                 if payload.is_empty() {
@@ -398,14 +420,20 @@ pub fn run_relay(listen: &str, iface: Ipv4Addr, lan_port: u16) -> io::Result<()>
         })
     };
 
-    // LAN -> scream
+    // LAN to scream. The timeout also paces the eviction of stale clients,
+    // so a scream that went away is forgotten on a quiet LAN too
+    lan.set_read_timeout(Some(Duration::from_secs(1)))?;
     let mut buf = [0u8; 2048];
     loop {
-        let (n, from) = match lan.recv_from(&mut buf) {
-            Ok(v) => v,
+        let received = lan.recv_from(&mut buf);
+        let now = Instant::now();
+        let mut guard = clients.lock().unwrap();
+        guard.retain(|_, seen| now.duration_since(*seen) < STALE);
+        let (n, from) = match received {
+            Ok(received) => received,
             Err(_) => {
                 if up.is_finished() {
-                    return Ok(());
+                    return Err(up.join().unwrap_or_else(|_| io::Error::other("tunnel thread panicked")));
                 }
                 continue;
             }
@@ -413,10 +441,7 @@ pub fn run_relay(listen: &str, iface: Ipv4Addr, lan_port: u16) -> io::Result<()>
         if !buf[..n].starts_with(b"M-SEARCH") {
             continue;
         }
-        let frame = encode_frame(from, &buf[..n]);
-        let now = Instant::now();
-        let mut guard = clients.lock().unwrap();
-        guard.retain(|_, seen| now.duration_since(*seen) < Duration::from_secs(120));
+        let frame = encode_frame(from, &buf[..n])?;
         for client in guard.keys() {
             let _ = tun.send_to(&frame, client);
         }
@@ -615,14 +640,10 @@ fn soap_action(headers: &[(String, String)]) -> Option<String> {
 // The base url to write into responses: the advertised one, else whatever
 // address this connection came in on
 fn response_base_url(stream: &TcpStream) -> String {
-    if let Some(base) = advertise_url() {
-        return base.to_string();
-    }
-    let host = stream
-        .local_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
-    format!("http://{host}")
+    base_url_or(|| {
+        let host = stream.local_addr().map(|a| a.to_string()).unwrap_or_default();
+        Some(format!("http://{host}"))
+    }).unwrap_or_default()
 }
 
 // Answers a /dlna request on the shared http socket. Returns false for a
@@ -757,7 +778,7 @@ mod tests {
     #[test]
     fn tunnel_frame_round_trips_address_and_payload() {
         let addr = SocketAddr::from(([239, 255, 255, 250], 1900));
-        let framed = encode_frame(addr, b"NOTIFY * HTTP/1.1");
+        let framed = encode_frame(addr, b"NOTIFY * HTTP/1.1").unwrap();
         let (back, payload) = decode_frame(&framed).unwrap();
         assert_eq!(back, addr);
         assert_eq!(payload, b"NOTIFY * HTTP/1.1");
@@ -765,7 +786,7 @@ mod tests {
 
     #[test]
     fn tunnel_keepalive_frame_has_no_payload() {
-        let framed = encode_frame(SocketAddr::from(([0, 0, 0, 0], 0)), &[]);
+        let framed = encode_frame(SocketAddr::from(([0, 0, 0, 0], 0)), &[]).unwrap();
         let (_, payload) = decode_frame(&framed).unwrap();
         assert!(payload.is_empty());
     }

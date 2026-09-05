@@ -24,8 +24,8 @@ use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::OnceLock;
-use std::sync::{mpsc, Arc, Mutex};
-use std::time::Duration;
+use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::time::{Duration, Instant};
 use wayland_client::protocol::{
     wl_buffer::WlBuffer,
     wl_output::{self, WlOutput},
@@ -71,10 +71,10 @@ struct Args {
     /// Port to bind the RTSP server to
     #[arg(long, default_value = "7001")]
     bind_port: String,
-    /// Composite canvas width; defaults to wl_output width (toplevel mode only)
+    /// Composite canvas width, defaults to wl_output width (toplevel mode only)
     #[arg(long)]
     width: Option<u32>,
-    /// Composite canvas height; defaults to wl_output height (toplevel mode only)
+    /// Composite canvas height, defaults to wl_output height (toplevel mode only)
     #[arg(long)]
     height: Option<u32>,
     /// Frames per second to capture and encode
@@ -83,7 +83,7 @@ struct Args {
     /// Port for the http mjpeg stream a browser can display, 0 disables it
     #[arg(long, default_value = "7002")]
     http_port: u16,
-    /// Port the media player relays stream audio to, opus over rtp; 0 disables
+    /// Port the media player relays stream audio to, opus over rtp, 0 disables
     #[arg(long, env = "STREAM_AUDIO_PORT", default_value = "7005")]
     audio_port: u16,
     /// Do not announce the stream over ssdp for dlna players
@@ -95,13 +95,13 @@ struct Args {
     stream_title: String,
     /// Base URL clients should reach this stream at, e.g.
     /// http://192.168.1.10:7002. Overrides the address scream autodetects for
-    /// the ssdp LOCATION and the DLNA stream url; needed behind a NAT or in a
+    /// the ssdp LOCATION and the DLNA stream url. Needed behind a NAT or in a
     /// container where the published port differs from the internal one
     #[arg(long, env = "STREAM_ADVERTISE_URL")]
     advertise_url: Option<String>,
     /// Tunnel ssdp over one unicast udp connection to a `scream
     /// --ssdp-relay-server` at this host:port instead of speaking multicast
-    /// directly; use when multicast cannot leave the container/VM, e.g.
+    /// directly. Use when multicast cannot leave the container/VM, e.g.
     /// host.containers.internal:1901
     #[arg(long, env = "STREAM_SSDP_RELAY")]
     ssdp_relay: Option<String>,
@@ -113,11 +113,11 @@ struct Args {
     /// Address the relay accepts scream instances on (--ssdp-relay-server)
     #[arg(long, default_value = "0.0.0.0:1901")]
     ssdp_relay_listen: String,
-    /// Local IPv4 address to join the ssdp group on (--ssdp-relay-server);
+    /// Local IPv4 address to join the ssdp group on (--ssdp-relay-server),
     /// 0.0.0.0 uses the default-route interface
     #[arg(long, default_value = "0.0.0.0")]
     ssdp_relay_iface: String,
-    /// UDP port the relay listens for the ssdp group on (--ssdp-relay-server);
+    /// UDP port the relay listens for the ssdp group on (--ssdp-relay-server),
     /// 1900 is the standard and what clients send M-SEARCH to
     #[arg(long, default_value = "1900")]
     ssdp_relay_lan_port: u16,
@@ -180,7 +180,23 @@ mod titled_media {
 }
 
 fn frame_interval() -> Duration {
-    Duration::from_millis(1000 / framerate().max(1) as u64)
+    Duration::from_secs(1) / framerate().max(1)
+}
+
+// Paces a feed loop at the frame rate without the drift a sleep after the
+// work adds. A turn that overran starts the next one right away
+fn next_turn(deadline: &mut Instant) {
+    *deadline += frame_interval();
+    let now = Instant::now();
+    match deadline.checked_duration_since(now) {
+        Some(wait) => std::thread::sleep(wait),
+        None => *deadline = now,
+    }
+}
+
+// Where the pipeline clock stands for this element, None until it is PLAYING
+fn running_time(el: &gst_app::AppSrc) -> Option<gst::ClockTime> {
+    Some(el.clock()?.time().saturating_sub(el.base_time()?))
 }
 
 // A short queue that drops the oldest frame rather than block: the live
@@ -200,7 +216,9 @@ fn make_queue() -> gst::Element {
 
 #[derive(Clone)]
 struct LatestFrame {
-    pixels: Vec<u8>,
+    // Shared, so a consumer's clone and the buffer wrapping it are refcounts,
+    // not more copies of the frame
+    pixels: Arc<[u8]>,
     width: u32,
     height: u32,
     gst_format: &'static str,
@@ -220,6 +238,44 @@ fn frames() -> &'static FrameSlot {
     FRAMES.get_or_init(|| Arc::new(Mutex::new(None)))
 }
 
+fn latest_frame() -> Option<LatestFrame> {
+    frames().lock().ok()?.clone()
+}
+
+fn video_caps(frame: &LatestFrame) -> gst::Caps {
+    gst::Caps::builder("video/x-raw")
+        .field("format", frame.gst_format)
+        .field("width", frame.width as i32)
+        .field("height", frame.height as i32)
+        .field("framerate", gst::Fraction::new(framerate() as i32, 1))
+        .build()
+}
+
+// One raw video appsrc. Caps come from the first frame. Frames wait until the
+// pipeline is PLAYING and has a clock, since do-timestamp stamps with it at
+// push and an appsrc without one emits them unstamped
+struct VideoFeed {
+    src: gst_app::AppSrc,
+    caps_set: bool,
+}
+
+impl VideoFeed {
+    fn new(src: gst_app::AppSrc) -> Self {
+        VideoFeed { src, caps_set: false }
+    }
+
+    fn push(&mut self, frame: LatestFrame) -> bool {
+        if self.src.clock().is_none() {
+            return true;
+        }
+        if !self.caps_set {
+            self.src.set_caps(Some(&video_caps(&frame)));
+            self.caps_set = true;
+        }
+        self.src.push_buffer(gst::Buffer::from_slice(frame.pixels)).is_ok()
+    }
+}
+
 fn capture_shutdown() -> &'static Arc<AtomicBool> {
     CAPTURE_SHUTDOWN.get_or_init(|| Arc::new(AtomicBool::new(false)))
 }
@@ -234,10 +290,21 @@ fn ensure_capture() {
 }
 
 // The media player relays the current stream's audio here, opus over rtp. One
-// capture thread decodes it to raw pcm, the rtsp pay1 and every webm client
-// read chunks from the queue, padding silence when nothing is playing
-type PcmQueue = Arc<Mutex<VecDeque<Vec<u8>>>>;
-static AUDIO_PCM: OnceLock<PcmQueue> = OnceLock::new();
+// capture thread decodes it to raw pcm and fans each chunk out to every
+// subscriber, so the rtsp pay1 and each webm client hear the whole stream
+// instead of splitting chunks between however many are listening at once
+//
+// Each chunk carries the clock time it left the jitterbuffer. Every pipeline
+// here runs on the one system clock, so an output pipeline places a chunk on
+// its own running time by subtracting its base time, and the audio lands
+// where video stamped by that same clock lands. Metering chunks out at the
+// video feed's pace, as this used to, stamped two chunks alike whenever two
+// fell into one turn and dropped one in fourteen because the pace ran a
+// little slow, which a sleep after the work always does
+type PcmChunk = (gst::ClockTime, Vec<u8>);
+type PcmQueue = Arc<Mutex<VecDeque<PcmChunk>>>;
+type PcmSubscribers = Mutex<Vec<Weak<Mutex<VecDeque<PcmChunk>>>>>;
+static AUDIO_SUBSCRIBERS: OnceLock<PcmSubscribers> = OnceLock::new();
 static AUDIO_CAPTURE: AtomicBool = AtomicBool::new(false);
 // Set once from Args so the http handlers can reach it, 0 disables audio
 static AUDIO_PORT: AtomicU16 = AtomicU16::new(0);
@@ -247,10 +314,29 @@ fn audio_port() -> u16 {
 }
 
 // 20 ms of 48 kHz interleaved stereo s16, the opusdec output chunk
+const AUDIO_CHUNK: gst::ClockTime = gst::ClockTime::from_mseconds(20);
 const AUDIO_CHUNK_BYTES: usize = 960 * 2 * 2;
+// The media player sends over loopback, so this covers ordinary scheduling
+// jitter without the far larger fixed delay a real network hop would need
+const AUDIO_JITTER: gst::ClockTime = gst::ClockTime::from_mseconds(60);
+// How far behind the clock the audio timeline may fall before silence pads
+// it. Longer than a chunk waits for the next feed turn, so real audio is
+// never displaced by padding
+const AUDIO_QUIET_AFTER: gst::ClockTime = gst::ClockTime::from_mseconds(100);
+// A consumer drains its queue every feed turn, so this only bounds what a
+// stalled one piles up
+const AUDIO_QUEUE_CHUNKS: usize = 50;
 
-fn audio_pcm() -> &'static PcmQueue {
-    AUDIO_PCM.get_or_init(|| Arc::new(Mutex::new(VecDeque::new())))
+fn audio_subscribers() -> &'static PcmSubscribers {
+    AUDIO_SUBSCRIBERS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+// A new queue of this consumer's own, registered to receive every chunk the
+// decode thread produces from here on
+fn subscribe_audio() -> PcmQueue {
+    let q: PcmQueue = Arc::new(Mutex::new(VecDeque::new()));
+    audio_subscribers().lock().unwrap().push(Arc::downgrade(&q));
+    q
 }
 
 fn audio_caps() -> gst::Caps {
@@ -262,15 +348,6 @@ fn audio_caps() -> gst::Caps {
         .build()
 }
 
-// One buffered chunk, or silence when the queue is empty
-fn next_audio_chunk() -> Vec<u8> {
-    audio_pcm()
-        .lock()
-        .ok()
-        .and_then(|mut q| q.pop_front())
-        .unwrap_or_else(|| vec![0u8; AUDIO_CHUNK_BYTES])
-}
-
 fn ensure_audio_capture(port: u16) {
     if port == 0 || AUDIO_CAPTURE.swap(true, Ordering::SeqCst) {
         return;
@@ -279,11 +356,12 @@ fn ensure_audio_capture(port: u16) {
         let desc = format!(
             "udpsrc port={port} \
              caps=application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,payload=97 \
-             ! rtpjitterbuffer latency=400 mode=none do-lost=true \
+             ! rtpjitterbuffer latency={jitter} mode=none do-lost=true \
              ! rtpopusdepay ! opusdec plc=true \
              ! audioconvert ! audioresample \
              ! audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved \
-             ! appsink name=asink sync=false max-buffers=64 drop=true"
+             ! appsink name=asink sync=false max-buffers=64 drop=true",
+            jitter = AUDIO_JITTER.mseconds()
         );
         let pipeline = match gst::parse::launch(&desc) {
             Ok(e) => e.downcast::<gst::Pipeline>().unwrap(),
@@ -307,14 +385,24 @@ fn ensure_audio_capture(port: u16) {
         loop {
             match asink.try_pull_sample(gst::ClockTime::from_seconds(1)) {
                 Some(sample) => {
-                    if let Some(map) = sample.buffer().and_then(|b| b.map_readable().ok()) {
-                        if let Ok(mut q) = audio_pcm().lock() {
-                            q.push_back(map.as_slice().to_vec());
-                            while q.len() > 64 {
+                    let Some(buffer) = sample.buffer() else { continue };
+                    let (Some(pts), Some(base), Ok(map)) =
+                        (buffer.pts(), pipeline.base_time(), buffer.map_readable())
+                    else {
+                        continue;
+                    };
+                    let chunk = (pts + base + AUDIO_JITTER, map.as_slice().to_vec());
+                    let mut subs = audio_subscribers().lock().unwrap();
+                    subs.retain(|weak| {
+                        let Some(q) = weak.upgrade() else { return false };
+                        if let Ok(mut q) = q.lock() {
+                            q.push_back(chunk.clone());
+                            while q.len() > AUDIO_QUEUE_CHUNKS {
                                 q.pop_front();
                             }
                         }
-                    }
+                        true
+                    });
                 }
                 None if asink.is_eos() => break,
                 None => {}
@@ -325,17 +413,67 @@ fn ensure_audio_capture(port: u16) {
     });
 }
 
+// The audio timeline of one output pipeline. Its queue is drained every feed
+// turn, each chunk stamped where its due time falls on this pipeline's
+// running time, so the feed loop's pace can neither stretch nor squeeze the
+// audio. Silence keeps the timeline going while nothing arrives, so a
+// client's audio branch prerolls and plays when no media view is up
+struct AudioFeed {
+    src: gst_app::AppSrc,
+    queue: PcmQueue,
+    next_pts: Option<gst::ClockTime>,
+}
+
+impl AudioFeed {
+    fn new(src: gst_app::AppSrc, port: u16) -> Self {
+        ensure_audio_capture(port);
+        AudioFeed { src, queue: subscribe_audio(), next_pts: None }
+    }
+
+    fn push(&mut self) -> bool {
+        let (Some(now), Some(base)) = (running_time(&self.src), self.src.base_time()) else {
+            return true;
+        };
+        let mut next = *self.next_pts.get_or_insert(now);
+        loop {
+            let chunk = self.queue.lock().ok().and_then(|mut q| q.pop_front());
+            let (pts, pcm) = match chunk {
+                Some((due, pcm)) => (due.saturating_sub(base), pcm),
+                None if next + AUDIO_QUIET_AFTER <= now => (next, vec![0u8; AUDIO_CHUNK_BYTES]),
+                None => break,
+            };
+            // Already covered by silence, or a stale burst after the source
+            // stalled. Dropping it keeps the timeline on the clock instead of
+            // letting it run ahead of the video
+            if pts + AUDIO_CHUNK / 2 < next {
+                continue;
+            }
+            let mut buf = gst::Buffer::from_slice(pcm);
+            {
+                let buf = buf.get_mut().unwrap();
+                buf.set_pts(pts);
+                buf.set_duration(AUDIO_CHUNK);
+            }
+            if self.src.push_buffer(buf).is_err() {
+                return false;
+            }
+            next = pts + AUDIO_CHUNK;
+        }
+        self.next_pts = Some(next);
+        true
+    }
+}
 
 // A persistent pipeline: building one per frame would cost more than the encode
 struct JpegEncoder {
-    appsrc: gst_app::AppSrc,
+    video: VideoFeed,
     sink: gst_app::AppSink,
     pipeline: gst::Pipeline,
-    caps_set: bool,
 }
 
 impl JpegEncoder {
     fn new() -> Result<Self, String> {
+        ensure_capture();
         let pipeline = gst::Pipeline::new();
         let appsrc = gst_app::AppSrc::builder().is_live(true).format(gst::Format::Time).build();
         let convert = gst::ElementFactory::make("videoconvert").build().map_err(|e| e.to_string())?;
@@ -347,22 +485,11 @@ impl JpegEncoder {
             .map_err(|e| e.to_string())?;
         pipeline.set_state(gst::State::Playing).map_err(|e| e.to_string())?;
 
-        Ok(JpegEncoder { appsrc, sink, pipeline, caps_set: false })
+        Ok(JpegEncoder { video: VideoFeed::new(appsrc), sink, pipeline })
     }
 
-    fn encode(&mut self, frame: &LatestFrame) -> Option<Vec<u8>> {
-        if !self.caps_set {
-            let caps = gst::Caps::builder("video/x-raw")
-                .field("format", frame.gst_format)
-                .field("width", frame.width as i32)
-                .field("height", frame.height as i32)
-                .field("framerate", gst::Fraction::new(framerate() as i32, 1))
-                .build();
-            self.appsrc.set_caps(Some(&caps));
-            self.caps_set = true;
-        }
-        let buf = gst::Buffer::from_slice(frame.pixels.clone());
-        self.appsrc.push_buffer(buf).ok()?;
+    fn encode(&mut self, frame: LatestFrame) -> Option<Vec<u8>> {
+        self.video.push(frame).then_some(())?;
         let sample = self.sink.try_pull_sample(gst::ClockTime::from_seconds(2))?;
         let map = sample.buffer()?.map_readable().ok()?;
 
@@ -389,9 +516,9 @@ fn serve_http(listener: TcpListener) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         std::thread::spawn(move || {
+            let mut stream = stream;
             // Stops an idle kept-alive connection from pinning its thread
             let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
-            let mut stream = stream;
             loop {
                 match handle_http(&mut stream) {
                     Ok(HttpNext::KeepAlive) => continue,
@@ -458,7 +585,6 @@ fn handle_http(stream: &mut TcpStream) -> std::io::Result<HttpNext> {
         return Ok(HttpNext::KeepAlive);
     }
 
-    ensure_capture();
     match path.as_str() {
         "/snapshot" | "/screenshot" => {
             SNAPSHOTS_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -510,6 +636,7 @@ fn handle_http(stream: &mut TcpStream) -> std::io::Result<HttpNext> {
             };
             stream.write_all(
                 b"HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=screamframe\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n")?;
+            let mut deadline = Instant::now();
             loop {
                 match latest_jpeg(&mut encoder) {
                     Some(jpeg) => {
@@ -520,7 +647,7 @@ fn handle_http(stream: &mut TcpStream) -> std::io::Result<HttpNext> {
                     }
                     None => std::thread::sleep(Duration::from_millis(100)),
                 }
-                std::thread::sleep(frame_interval());
+                next_turn(&mut deadline);
             }
         }
         _ => {
@@ -539,15 +666,12 @@ fn stream_chunked(stream: &mut TcpStream, mut encoder: StreamEncoder,
         "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").as_bytes())?;
 
     let mut idle = 0u32;
-    // Audio chunks are 20 ms, a video frame interval is longer, so carry the
-    // remainder and push as many chunks as fit each turn
-    let mut audio_debt = Duration::ZERO;
+    let mut deadline = Instant::now();
     loop {
-        let frame = frames().lock().ok().and_then(|f| f.clone());
-        match frame {
+        match latest_frame() {
             Some(f) => {
                 idle = 0;
-                if !encoder.push(&f) {
+                if !encoder.push(f) {
                     log_http("appsrc rejected a buffer, closing");
                     break;
                 }
@@ -560,10 +684,9 @@ fn stream_chunked(stream: &mut TcpStream, mut encoder: StreamEncoder,
                 }
             }
         }
-        audio_debt += frame_interval();
-        while audio_debt >= Duration::from_millis(20) {
-            encoder.push_audio();
-            audio_debt -= Duration::from_millis(20);
+        if !encoder.push_audio() {
+            log_http("audio appsrc rejected a buffer, closing");
+            break;
         }
         while let Some(chunk) = encoder.pull() {
             write!(stream, "{:x}\r\n", chunk.len())?;
@@ -571,7 +694,7 @@ fn stream_chunked(stream: &mut TcpStream, mut encoder: StreamEncoder,
             stream.write_all(b"\r\n")?;
             stream.flush()?;
         }
-        std::thread::sleep(frame_interval());
+        next_turn(&mut deadline);
     }
     let _ = stream.write_all(b"0\r\n\r\n");
 
@@ -583,11 +706,10 @@ fn stream_chunked(stream: &mut TcpStream, mut encoder: StreamEncoder,
 // no javascript, unlike hls which desktop chrome and firefox will not touch
 // without hls.js. h264 in matroska is the same shape for dlna players
 struct StreamEncoder {
-    appsrc: gst_app::AppSrc,
-    audio: Option<gst_app::AppSrc>,
+    video: VideoFeed,
+    audio: Option<AudioFeed>,
     sink: gst_app::AppSink,
     pipeline: gst::Pipeline,
-    caps_set: bool,
 }
 
 impl StreamEncoder {
@@ -625,14 +747,20 @@ impl StreamEncoder {
     }
 
     fn build(enc: gst::Element, mux: gst::Element, audio_port: u16) -> Result<Self, String> {
+        ensure_capture();
         // The container title a browser or dlna player shows for the stream
         if let Some(ts) = mux.dynamic_cast_ref::<gst::TagSetter>() {
             ts.add_tag::<gst::tags::Title>(&stream_title(), gst::TagMergeMode::Replace);
         }
 
         let pipeline = gst::Pipeline::new();
+        // A live appsrc reports no room for latency, the opus encoder needs a
+        // frame of it, and the muxer logs the mismatch on every buffer. The
+        // appsrc queue is unbounded, so a second of room is honest. appsrc
+        // only applies max-latency when min-latency is set as well
         let appsrc = gst_app::AppSrc::builder()
-            .is_live(true).do_timestamp(true).format(gst::Format::Time).build();
+            .is_live(true).do_timestamp(true).format(gst::Format::Time)
+            .min_latency(0).max_latency(1_000_000_000).build();
         let convert = gst::ElementFactory::make("videoconvert").build().map_err(|e| e.to_string())?;
         let sink = gst_app::AppSink::builder().sync(false).max_buffers(4).drop(false).build();
         pipeline.add_many([appsrc.upcast_ref(), &convert, &enc, &mux, sink.upcast_ref()])
@@ -643,10 +771,8 @@ impl StreamEncoder {
         mux.link(&sink).map_err(|e| e.to_string())?;
 
         let audio = if audio_port != 0 {
-            ensure_audio_capture(audio_port);
             let asrc = gst_app::AppSrc::builder()
-                .is_live(true).do_timestamp(true).format(gst::Format::Time)
-                .caps(&audio_caps()).build();
+                .is_live(true).format(gst::Format::Time).caps(&audio_caps()).build();
             let aconv = gst::ElementFactory::make("audioconvert").build().map_err(|e| e.to_string())?;
             let ares = gst::ElementFactory::make("audioresample").build().map_err(|e| e.to_string())?;
             let aenc = gst::ElementFactory::make("opusenc")
@@ -656,39 +782,27 @@ impl StreamEncoder {
             gst::Element::link_many([asrc.upcast_ref(), &aconv, &ares, &aenc])
                 .map_err(|e| e.to_string())?;
             aenc.link(&mux).map_err(|e| e.to_string())?;
-            Some(asrc)
+            Some(AudioFeed::new(asrc, audio_port))
         } else {
             None
         };
 
         pipeline.set_state(gst::State::Playing).map_err(|e| e.to_string())?;
 
-        Ok(StreamEncoder { appsrc, audio, sink, pipeline, caps_set: false })
+        Ok(StreamEncoder { video: VideoFeed::new(appsrc), audio, sink, pipeline })
     }
 
-    fn push(&mut self, frame: &LatestFrame) -> bool {
-        if !self.caps_set {
-            let caps = gst::Caps::builder("video/x-raw")
-                .field("format", frame.gst_format)
-                .field("width", frame.width as i32)
-                .field("height", frame.height as i32)
-                .field("framerate", gst::Fraction::new(framerate() as i32, 1))
-                .build();
-            self.appsrc.set_caps(Some(&caps));
-            self.caps_set = true;
-        }
-
-        self.appsrc.push_buffer(gst::Buffer::from_slice(frame.pixels.clone())).is_ok()
+    fn push(&mut self, frame: LatestFrame) -> bool {
+        self.video.push(frame)
     }
 
-    fn push_audio(&mut self) {
-        if let Some(src) = &self.audio {
-            let _ = src.push_buffer(gst::Buffer::from_slice(next_audio_chunk()));
-        }
+    fn push_audio(&mut self) -> bool {
+        self.audio.as_mut().is_none_or(|a| a.push())
     }
 
+    // Only what is already muxed, waiting here would stretch the turn
     fn pull(&mut self) -> Option<Vec<u8>> {
-        let sample = self.sink.try_pull_sample(gst::ClockTime::from_mseconds(50))?;
+        let sample = self.sink.try_pull_sample(gst::ClockTime::ZERO)?;
         let map = sample.buffer()?.map_readable().ok()?;
 
         Some(map.as_slice().to_vec())
@@ -702,12 +816,10 @@ impl Drop for StreamEncoder {
 }
 
 fn latest_jpeg(encoder: &mut JpegEncoder) -> Option<Vec<u8>> {
-    let frame = frames().lock().ok()?.clone()?;
-
-    encoder.encode(&frame)
+    encoder.encode(latest_frame()?)
 }
 
-// Coordinator — monitors toplevels + wl_output, fires events
+// Coordinator, monitors toplevels + wl_output, fires events
 
 enum CoordEvent {
     NewToplevel { identifier: String, app_id: String, title: String },
@@ -837,12 +949,8 @@ fn coordinator_loop(tx: mpsc::Sender<CoordEvent>, shutdown: Arc<AtomicBool>) {
     let mut last_output_h = 0u32;
 
     while !shutdown.load(Ordering::Relaxed) {
-        if eq.dispatch_pending(&mut state).is_err() {
+        if !poll_events(&conn, &mut eq, &mut state) {
             eprintln!("coordinator: compositor disconnected");
-            break;
-        }
-        if conn.flush().is_err() {
-            eprintln!("coordinator: flush failed, compositor may have gone away");
             break;
         }
 
@@ -874,62 +982,34 @@ fn coordinator_loop(tx: mpsc::Sender<CoordEvent>, shutdown: Arc<AtomicBool>) {
     }
 }
 
-// Output-size query — blocking, one-shot
-
-#[derive(Default)]
-struct SizeQueryState {
-    width: u32,
-    height: u32,
-}
-
-impl Dispatch<WlRegistry, ()> for SizeQueryState {
-    fn event(
-        _: &mut Self, registry: &WlRegistry,
-        event: <WlRegistry as Proxy>::Event,
-        _: &(), _: &Connection, qh: &QueueHandle<Self>,
-    ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
-            if interface == "wl_output" {
-                registry.bind::<WlOutput, _, _>(name, version.min(2), qh, ());
-            }
-        }
-    }
-}
-
-impl Dispatch<WlOutput, ()> for SizeQueryState {
-    fn event(
-        state: &mut Self, _: &WlOutput,
-        event: <WlOutput as Proxy>::Event,
-        _: &(), _: &Connection, _: &QueueHandle<Self>,
-    ) {
-        if let wl_output::Event::Mode { width, height, .. } = event {
-            state.width = width as u32;
-            state.height = height as u32;
-        }
-    }
-}
-
+// Output size, blocking, one-shot, on the coordinator's state: the wl_output
+// modes arrive with the first roundtrip
 fn query_output_size() -> Option<(u32, u32)> {
     let conn = Connection::connect_to_env().ok()?;
-    let mut eq: EventQueue<SizeQueryState> = conn.new_event_queue();
-    let qh = eq.handle();
-    conn.display().get_registry(&qh, ());
-    let mut state = SizeQueryState::default();
+    let mut eq: EventQueue<CoordState> = conn.new_event_queue();
+    conn.display().get_registry(&eq.handle(), ());
+    let mut state = CoordState::default();
     eq.roundtrip(&mut state).ok()?;
     eq.roundtrip(&mut state).ok()?;
-    if state.width > 0 && state.height > 0 { Some((state.width, state.height)) } else { None }
+
+    (state.output_w > 0 && state.output_h > 0).then_some((state.output_w, state.output_h))
 }
 
 // Capture-thread Wayland state
 //
-// Each capture thread gets its own Wayland connection and binds
-// ext_foreign_toplevel_list_v1 to find its target handle by identifier, then
-// uses ext_foreign_toplevel_image_capture_source_manager_v1 to capture frames
+// Each capture thread gets its own Wayland connection. An output capture
+// binds the output and its source manager, a toplevel capture (target_id
+// set) binds the toplevel list to find its handle by identifier and that
+// source manager. Session and frame handling are the same from there
 
+#[derive(Default)]
 struct CaptureState {
+    target_id: String,
+    output: Option<WlOutput>,
     shm: Option<WlShm>,
     toplevel_list: Option<ExtForeignToplevelListV1>,
     toplevel_source_manager: Option<ExtForeignToplevelImageCaptureSourceManagerV1>,
+    output_source_manager: Option<ExtOutputImageCaptureSourceManagerV1>,
     capture_manager: Option<ExtImageCopyCaptureManagerV1>,
     toplevels: Vec<CapTop>,
     width: u32,
@@ -938,18 +1018,6 @@ struct CaptureState {
     constraints_dirty: bool,
     session_stopped: bool,
     frame_result: Option<FrameResult>,
-}
-
-impl Default for CaptureState {
-    fn default() -> Self {
-        Self {
-            shm: None, toplevel_list: None,
-            toplevel_source_manager: None, capture_manager: None,
-            toplevels: Vec::new(),
-            width: 0, height: 0, shm_format: None,
-            constraints_dirty: false, session_stopped: false, frame_result: None,
-        }
-    }
 }
 
 struct CapTop {
@@ -969,29 +1037,42 @@ impl Dispatch<WlRegistry, ()> for CaptureState {
         event: <WlRegistry as Proxy>::Event,
         _: &(), _: &Connection, qh: &QueueHandle<Self>,
     ) {
+        let toplevel = !state.target_id.is_empty();
         if let wl_registry::Event::Global { name, interface, version } = event {
             match interface.as_str() {
                 "wl_shm" => state.shm = Some(registry.bind(name, version.min(1), qh, ())),
-                "ext_foreign_toplevel_list_v1" =>
-                    state.toplevel_list = Some(registry.bind(name, version.min(1), qh, ())),
-                "ext_foreign_toplevel_image_capture_source_manager_v1" =>
-                    state.toplevel_source_manager = Some(registry.bind(name, version.min(1), qh, ())),
                 "ext_image_copy_capture_manager_v1" =>
                     state.capture_manager = Some(registry.bind(name, version.min(1), qh, ())),
+                "wl_output" if !toplevel && state.output.is_none() =>
+                    state.output = Some(registry.bind(name, version.min(4), qh, ())),
+                "ext_output_image_capture_source_manager_v1" if !toplevel =>
+                    state.output_source_manager = Some(registry.bind(name, version.min(1), qh, ())),
+                "ext_foreign_toplevel_list_v1" if toplevel =>
+                    state.toplevel_list = Some(registry.bind(name, version.min(1), qh, ())),
+                "ext_foreign_toplevel_image_capture_source_manager_v1" if toplevel =>
+                    state.toplevel_source_manager = Some(registry.bind(name, version.min(1), qh, ())),
                 _ => {}
             }
         }
     }
 }
-impl Dispatch<WlShm, ()> for CaptureState {
-    fn event(_: &mut Self, _: &WlShm, _: <WlShm as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+
+// Objects whose events carry nothing this side acts on
+macro_rules! ignore_events {
+    ($($iface:ty),* $(,)?) => {$(
+        impl Dispatch<$iface, ()> for CaptureState {
+            fn event(_: &mut Self, _: &$iface, _: <$iface as Proxy>::Event,
+                     _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+        }
+    )*};
 }
-impl Dispatch<WlShmPool, ()> for CaptureState {
-    fn event(_: &mut Self, _: &WlShmPool, _: <WlShmPool as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
-}
-impl Dispatch<WlBuffer, ()> for CaptureState {
-    fn event(_: &mut Self, _: &WlBuffer, _: <WlBuffer as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
-}
+ignore_events!(
+    WlOutput, WlShm, WlShmPool, WlBuffer,
+    ExtForeignToplevelImageCaptureSourceManagerV1,
+    ExtOutputImageCaptureSourceManagerV1,
+    ExtImageCaptureSourceV1, ExtImageCopyCaptureManagerV1,
+);
+
 impl Dispatch<ExtForeignToplevelListV1, ()> for CaptureState {
     fn event(
         state: &mut Self, _: &ExtForeignToplevelListV1,
@@ -1016,23 +1097,15 @@ impl Dispatch<ExtForeignToplevelHandleV1, ()> for CaptureState {
             match event {
                 ext_foreign_toplevel_handle_v1::Event::Identifier { identifier } => t.identifier = identifier,
                 ext_foreign_toplevel_handle_v1::Event::Done => t.done = true,
-                // Window closed while we were still waiting, treat as session_stopped
-                ext_foreign_toplevel_handle_v1::Event::Closed => {
+                // Only the target closing ends this capture, every other
+                // window comes and goes through the same list
+                ext_foreign_toplevel_handle_v1::Event::Closed if t.identifier == state.target_id => {
                     state.session_stopped = true;
                 }
                 _ => {}
             }
         }
     }
-}
-impl Dispatch<ExtForeignToplevelImageCaptureSourceManagerV1, ()> for CaptureState {
-    fn event(_: &mut Self, _: &ExtForeignToplevelImageCaptureSourceManagerV1, _: <ExtForeignToplevelImageCaptureSourceManagerV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
-}
-impl Dispatch<ExtImageCaptureSourceV1, ()> for CaptureState {
-    fn event(_: &mut Self, _: &ExtImageCaptureSourceV1, _: <ExtImageCaptureSourceV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
-}
-impl Dispatch<ExtImageCopyCaptureManagerV1, ()> for CaptureState {
-    fn event(_: &mut Self, _: &ExtImageCopyCaptureManagerV1, _: <ExtImageCopyCaptureManagerV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
 }
 impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for CaptureState {
     fn event(
@@ -1107,87 +1180,72 @@ fn gst_video_format(format: wl_shm::Format) -> Option<&'static str> {
     }
 }
 
-// Toplevel capture thread
-//
-// Connects to the compositor independently, finds the target toplevel by its
-// stable identifier string, then runs the frame loop until the session stops
-// (window closed, compositor gone) or shutdown is signalled
+// Reads whatever the compositor has sent and dispatches it, without blocking,
+// so a loop that also watches flags can poll. dispatch_pending on its own
+// never reads the socket, only a read guard or a blocking dispatch does.
+// False once the connection is gone
+fn poll_events<S>(conn: &Connection, eq: &mut EventQueue<S>, state: &mut S) -> bool {
+    if conn.flush().is_err() {
+        return false;
+    }
+    if let Some(guard) = conn.prepare_read() {
+        match guard.read() {
+            Err(wayland_client::backend::WaylandError::Io(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(_) => return false,
+            Ok(_) => {}
+        }
+    }
+    eq.dispatch_pending(state).is_ok()
+}
 
-fn wayland_capture_loop_toplevel(
-    target_id: String,
-    slot: FrameSlot,
-    shutdown: Arc<AtomicBool>,
-) {
+fn stopped(flags: &[Arc<AtomicBool>]) -> bool {
+    flags.iter().any(|f| f.load(Ordering::Relaxed))
+}
+
+// Connects, binds the globals for this mode, one roundtrip so they are there
+fn connect_capture(target_id: &str, label: &str)
+    -> Option<(Connection, EventQueue<CaptureState>, CaptureState)> {
     let conn = match Connection::connect_to_env() {
         Ok(c) => c,
-        Err(e) => { eprintln!("capture[{target_id}]: connect: {e}"); return; }
+        Err(e) => { eprintln!("{label}: connect: {e}"); return None; }
     };
-    let mut eq: EventQueue<CaptureState> = conn.new_event_queue();
+    let mut eq = conn.new_event_queue();
+    conn.display().get_registry(&eq.handle(), ());
+    let mut state = CaptureState { target_id: target_id.to_string(), ..Default::default() };
+    eq.roundtrip(&mut state).ok()?;
+
+    Some((conn, eq, state))
+}
+
+// Waits for the session's constraints, then captures frame after frame into
+// the slot until the session stops or a stop flag is raised
+fn run_capture_session(
+    eq: &mut EventQueue<CaptureState>, state: &mut CaptureState, shm: &WlShm,
+    session: &ExtImageCopyCaptureSessionV1, slot: &FrameSlot,
+    stop: &[Arc<AtomicBool>], label: &str,
+) {
     let qh = eq.handle();
-    conn.display().get_registry(&qh, ());
-    let mut state = CaptureState::default();
-    if eq.roundtrip(&mut state).is_err() { return; }
-
-    let (Some(shm), Some(src_mgr), Some(cap_mgr)) =
-        (state.shm.take(), state.toplevel_source_manager.take(), state.capture_manager.take())
-    else {
-        eprintln!("capture[{target_id}]: missing globals");
-        return;
-    };
-
-    // Collect the initial toplevel list, wait for Done events
-    if eq.roundtrip(&mut state).is_err() { return; }
-    if eq.roundtrip(&mut state).is_err() { return; }
-
-    let handle = state.toplevels.iter()
-        .find(|t| t.identifier == target_id && t.done)
-        .map(|t| t.handle.clone());
-
-    // Window might arrive slightly after the initial batch if it was just opened
-    let handle = if let Some(h) = handle { h } else {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if shutdown.load(Ordering::Relaxed) || state.session_stopped { return; }
-            if eq.dispatch_pending(&mut state).is_err() { return; }
-            if conn.flush().is_err() { return; }
-            if let Some(h) = state.toplevels.iter().find(|t| t.identifier == target_id && t.done) {
-                break h.handle.clone();
-            }
-            if std::time::Instant::now() > deadline {
-                eprintln!("capture[{target_id}]: toplevel not found");
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
-    };
-
-    let source = src_mgr.create_source(&handle, &qh, ());
-    let session = cap_mgr.create_session(&source, Options::empty(), &qh, ());
-
-    while !state.constraints_dirty && !state.session_stopped && !shutdown.load(Ordering::Relaxed) {
-        if eq.blocking_dispatch(&mut state).is_err() { return; }
+    while !state.constraints_dirty && !state.session_stopped && !stopped(stop) {
+        if eq.blocking_dispatch(state).is_err() { return; }
     }
-    if shutdown.load(Ordering::Relaxed) { return; }
 
     let mut shm_buf: Option<ShmBuffer> = None;
     let mut gst_format: &'static str = "";
 
-    while !shutdown.load(Ordering::Relaxed) {
+    while !stopped(stop) {
         if state.session_stopped { return; }
-
         if state.constraints_dirty {
             state.constraints_dirty = false;
             let Some(fmt) = state.shm_format.take() else { return; };
             const MAX: u32 = 16384;
             if state.width == 0 || state.height == 0 || state.width > MAX || state.height > MAX { return; }
             let needs = shm_buf.as_ref().is_none_or(|b| b.width != state.width || b.height != state.height);
-            if needs { shm_buf = Some(new_shm_buffer(&shm, &qh, state.width, state.height, fmt)); }
+            if needs { shm_buf = Some(new_shm_buffer(shm, &qh, state.width, state.height, fmt)); }
             let Some(gf) = gst_video_format(fmt) else { return; };
             gst_format = gf;
         }
-
         let Some(buf) = shm_buf.as_ref() else {
-            if eq.blocking_dispatch(&mut state).is_err() { return; }
+            if eq.blocking_dispatch(state).is_err() { return; }
             continue;
         };
 
@@ -1197,18 +1255,19 @@ fn wayland_capture_loop_toplevel(
         frame.capture();
 
         state.frame_result = None;
-        while state.frame_result.is_none() && !state.session_stopped && !shutdown.load(Ordering::Relaxed) {
-            if eq.blocking_dispatch(&mut state).is_err() { frame.destroy(); return; }
+        while state.frame_result.is_none() && !state.session_stopped && !stopped(stop) {
+            if eq.blocking_dispatch(state).is_err() { frame.destroy(); return; }
         }
         frame.destroy();
 
         match state.frame_result.take() {
             Some(FrameResult::Ready) => {
-                let pixels = buf.mmap[..(buf.stride as usize * buf.height as usize)].to_vec();
-                *slot.lock().unwrap() = Some(LatestFrame { pixels, width: buf.width, height: buf.height, gst_format });
+                let pixels = Arc::from(&buf.mmap[..(buf.stride as usize * buf.height as usize)]);
+                *slot.lock().unwrap() =
+                    Some(LatestFrame { pixels, width: buf.width, height: buf.height, gst_format });
             }
             Some(FrameResult::Failed(r)) => {
-                eprintln!("capture[{target_id}]: frame failed: {r:?}");
+                eprintln!("{label}: frame failed: {r:?}");
                 std::thread::sleep(Duration::from_millis(100));
             }
             None => return,
@@ -1216,15 +1275,46 @@ fn wayland_capture_loop_toplevel(
     }
 }
 
+// Finds the target toplevel by its stable identifier, then captures it until
+// the window closes, the compositor goes or a stop flag is raised
+fn wayland_capture_loop_toplevel(target_id: String, slot: FrameSlot, stop: Vec<Arc<AtomicBool>>) {
+    let label = format!("capture[{target_id}]");
+    let Some((conn, mut eq, mut state)) = connect_capture(&target_id, &label) else { return };
+    let (Some(shm), Some(src_mgr), Some(cap_mgr)) =
+        (state.shm.take(), state.toplevel_source_manager.take(), state.capture_manager.take())
+    else {
+        eprintln!("{label}: missing globals");
+        return;
+    };
+
+    // The window might arrive after the initial batch if it was just opened
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let handle = loop {
+        if stopped(&stop) || state.session_stopped || !poll_events(&conn, &mut eq, &mut state) { return; }
+        if let Some(t) = state.toplevels.iter().find(|t| t.identifier == target_id && t.done) {
+            break t.handle.clone();
+        }
+        if Instant::now() > deadline {
+            eprintln!("{label}: toplevel not found");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    let qh = eq.handle();
+    let source = src_mgr.create_source(&handle, &qh, ());
+    let session = cap_mgr.create_session(&source, Options::empty(), &qh, ());
+    run_capture_session(&mut eq, &mut state, &shm, &session, &slot, &stop, &label);
+}
+
 // GStreamer compositor pipeline
 
 struct PipelineStream {
     identifier: String,
     slot: FrameSlot,
-    appsrc: gst_app::AppSrc,
+    video: VideoFeed,
     chain: Vec<gst::Element>, // videoconvert, videoscale, capsfilter, queue
     comp_sink: gst::Pad,
-    caps_set: bool,
     capture_shutdown: Arc<AtomicBool>,
 }
 
@@ -1330,9 +1420,9 @@ impl CompositorPipeline {
         }
 
         self.streams.push(PipelineStream {
-            identifier, slot, appsrc,
+            identifier, slot, video: VideoFeed::new(appsrc),
             chain: vec![convert, scale, cf, queue],
-            comp_sink, caps_set: false, capture_shutdown,
+            comp_sink, capture_shutdown,
         });
 
         self.recalculate_layout();
@@ -1352,8 +1442,8 @@ impl CompositorPipeline {
         self.compositor.release_request_pad(&stream.comp_sink);
 
         // Tear down the chain in reverse so nothing flows while unlinking
-        let _ = stream.appsrc.set_state(gst::State::Null);
-        self.pipeline.remove(&stream.appsrc).ok();
+        let _ = stream.video.src.set_state(gst::State::Null);
+        self.pipeline.remove(&stream.video.src).ok();
         for el in stream.chain.iter().rev() {
             let _ = el.set_state(gst::State::Null);
             self.pipeline.remove(el).ok();
@@ -1389,7 +1479,7 @@ impl CompositorPipeline {
 
 type SharedPipeline = Arc<Mutex<CompositorPipeline>>;
 
-// Pipeline manager — receives coordinator events and mutates the live pipeline
+// Pipeline manager, receives coordinator events and mutates the live pipeline
 fn pipeline_manager(
     shared: SharedPipeline,
     rx: mpsc::Receiver<CoordEvent>,
@@ -1409,26 +1499,14 @@ fn pipeline_manager(
                 if pl.streams.iter().any(|s| s.identifier == identifier) {
                     continue;
                 }
-                eprintln!("toplevel: capturing «{app_id}» — {title}");
+                eprintln!("toplevel: capturing {app_id}: {title}");
                 let slot: FrameSlot = Arc::new(Mutex::new(None));
                 let cap_sd = Arc::new(AtomicBool::new(false));
                 {
-                    let slot2 = slot.clone();
-                    let sd2   = cap_sd.clone();
-                    let id2   = identifier.clone();
-                    let overall = shutdown.clone();
-                    std::thread::spawn(move || {
-                        // Forward whichever of the two shutdown signals fires first
-                        let combined = Arc::new(AtomicBool::new(false));
-                        let comb2    = combined.clone();
-                        std::thread::spawn(move || {
-                            while !sd2.load(Ordering::Relaxed) && !overall.load(Ordering::Relaxed) {
-                                std::thread::sleep(Duration::from_millis(100));
-                            }
-                            comb2.store(true, Ordering::Relaxed);
-                        });
-                        wayland_capture_loop_toplevel(id2, slot2, combined);
-                    });
+                    let slot = slot.clone();
+                    let stop = vec![cap_sd.clone(), shutdown.clone()];
+                    let id = identifier.clone();
+                    std::thread::spawn(move || wayland_capture_loop_toplevel(id, slot, stop));
                 }
                 pl.add_stream(identifier, slot, cap_sd);
             }
@@ -1440,29 +1518,19 @@ fn pipeline_manager(
     }
 }
 
-// GStreamer feed loop — pushes the latest captured frame for each stream at 30 fps
+// Pushes the latest captured frame of each stream once per turn
 fn feed_loop(shared: SharedPipeline, shutdown: Arc<AtomicBool>) {
+    let mut deadline = Instant::now();
     while !shutdown.load(Ordering::Relaxed) {
         {
             let mut pl = shared.lock().unwrap();
             for s in pl.streams.iter_mut() {
                 if let Some(frame) = s.slot.lock().unwrap().clone() {
-                    if !s.caps_set {
-                        let caps = gst::Caps::builder("video/x-raw")
-                            .field("format", frame.gst_format)
-                            .field("width",  frame.width as i32)
-                            .field("height", frame.height as i32)
-                            .field("framerate", gst::Fraction::new(framerate() as i32, 1))
-                            .build();
-                        s.appsrc.set_caps(Some(&caps));
-                        s.caps_set = true;
-                    }
-                    let buf = gst::Buffer::from_slice(frame.pixels);
-                    let _ = s.appsrc.push_buffer(buf);
+                    s.video.push(frame);
                 }
             }
         }
-        std::thread::sleep(frame_interval());
+        next_turn(&mut deadline);
     }
 }
 
@@ -1486,212 +1554,40 @@ fn run_capture_toplevel(
     { let sh = shared.clone(); let sd = shutdown.clone(); std::thread::spawn(move || feed_loop(sh, sd)); }
 }
 
-// Output-mode capture
-
-#[derive(Default)]
-struct OutputState {
-    output: Option<WlOutput>,
-    shm: Option<WlShm>,
-    source_manager: Option<ExtOutputImageCaptureSourceManagerV1>,
-    capture_manager: Option<ExtImageCopyCaptureManagerV1>,
-    width: u32,
-    height: u32,
-    shm_format: Option<wl_shm::Format>,
-    constraints_dirty: bool,
-    session_stopped: bool,
-    frame_result: Option<FrameResult>,
-}
-
-impl Dispatch<WlRegistry, ()> for OutputState {
-    fn event(
-        state: &mut Self, registry: &WlRegistry,
-        event: <WlRegistry as Proxy>::Event,
-        _: &(), _: &Connection, qh: &QueueHandle<Self>,
-    ) {
-        if let wl_registry::Event::Global { name, interface, version } = event {
-            match interface.as_str() {
-                "wl_output" => {
-                    if state.output.is_none() {
-                        state.output = Some(registry.bind(name, version.min(4), qh, ()));
-                    }
-                }
-                "wl_shm" => state.shm = Some(registry.bind(name, version.min(1), qh, ())),
-                "ext_output_image_capture_source_manager_v1" =>
-                    state.source_manager = Some(registry.bind(name, version.min(1), qh, ())),
-                "ext_image_copy_capture_manager_v1" =>
-                    state.capture_manager = Some(registry.bind(name, version.min(1), qh, ())),
-                _ => {}
-            }
-        }
-    }
-}
-impl Dispatch<WlOutput, ()> for OutputState {
-    fn event(_: &mut Self, _: &WlOutput, _: <WlOutput as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
-}
-impl Dispatch<WlShm, ()> for OutputState {
-    fn event(_: &mut Self, _: &WlShm, _: <WlShm as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
-}
-impl Dispatch<WlShmPool, ()> for OutputState {
-    fn event(_: &mut Self, _: &WlShmPool, _: <WlShmPool as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
-}
-impl Dispatch<WlBuffer, ()> for OutputState {
-    fn event(_: &mut Self, _: &WlBuffer, _: <WlBuffer as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
-}
-impl Dispatch<ExtOutputImageCaptureSourceManagerV1, ()> for OutputState {
-    fn event(_: &mut Self, _: &ExtOutputImageCaptureSourceManagerV1, _: <ExtOutputImageCaptureSourceManagerV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
-}
-impl Dispatch<ExtImageCaptureSourceV1, ()> for OutputState {
-    fn event(_: &mut Self, _: &ExtImageCaptureSourceV1, _: <ExtImageCaptureSourceV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
-}
-impl Dispatch<ExtImageCopyCaptureManagerV1, ()> for OutputState {
-    fn event(_: &mut Self, _: &ExtImageCopyCaptureManagerV1, _: <ExtImageCopyCaptureManagerV1 as Proxy>::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
-}
-impl Dispatch<ExtImageCopyCaptureSessionV1, ()> for OutputState {
-    fn event(
-        state: &mut Self, _: &ExtImageCopyCaptureSessionV1,
-        event: <ExtImageCopyCaptureSessionV1 as Proxy>::Event,
-        _: &(), _: &Connection, _: &QueueHandle<Self>,
-    ) {
-        use ext_image_copy_capture_session_v1::Event;
-        match event {
-            Event::BufferSize { width, height } => { state.width = width; state.height = height; }
-            Event::ShmFormat { format: WEnum::Value(f) }
-                if state.shm_format.is_none() && matches!(f, wl_shm::Format::Xrgb8888 | wl_shm::Format::Argb8888) =>
-            { state.shm_format = Some(f); }
-            Event::Done    => state.constraints_dirty = true,
-            Event::Stopped => state.session_stopped = true,
-            _ => {}
-        }
-    }
-}
-impl Dispatch<ExtImageCopyCaptureFrameV1, ()> for OutputState {
-    fn event(
-        state: &mut Self, _: &ExtImageCopyCaptureFrameV1,
-        event: <ExtImageCopyCaptureFrameV1 as Proxy>::Event,
-        _: &(), _: &Connection, _: &QueueHandle<Self>,
-    ) {
-        match event {
-            ext_image_copy_capture_frame_v1::Event::Ready => state.frame_result = Some(FrameResult::Ready),
-            ext_image_copy_capture_frame_v1::Event::Failed { reason } => state.frame_result = Some(FrameResult::Failed(reason)),
-            _ => {}
-        }
-    }
-}
-
-fn wayland_capture_loop_output(latest_frame: Arc<Mutex<Option<LatestFrame>>>, shutdown: Arc<AtomicBool>) {
-    let conn = match Connection::connect_to_env() {
-        Ok(c) => c,
-        Err(e) => { eprintln!("output capture: connect: {e}"); return; }
-    };
-    let mut eq: EventQueue<OutputState> = conn.new_event_queue();
-    let qh = eq.handle();
-    conn.display().get_registry(&qh, ());
-    let mut state = OutputState::default();
-    if eq.roundtrip(&mut state).is_err() { return; }
-
+fn wayland_capture_loop_output(slot: FrameSlot, shutdown: Arc<AtomicBool>) {
+    let label = "output capture";
+    let Some((_conn, mut eq, mut state)) = connect_capture("", label) else { return };
     let (Some(output), Some(shm), Some(src_mgr), Some(cap_mgr)) =
-        (state.output.take(), state.shm.take(), state.source_manager.take(), state.capture_manager.take())
+        (state.output.take(), state.shm.take(), state.output_source_manager.take(), state.capture_manager.take())
     else {
-        eprintln!("output capture: missing globals");
+        eprintln!("{label}: missing globals");
         return;
     };
 
-    let source  = src_mgr.create_source(&output, &qh, ());
+    let qh = eq.handle();
+    let source = src_mgr.create_source(&output, &qh, ());
     let session = cap_mgr.create_session(&source, Options::empty(), &qh, ());
-
-    while !state.constraints_dirty && !state.session_stopped && !shutdown.load(Ordering::Relaxed) {
-        if eq.blocking_dispatch(&mut state).is_err() { return; }
-    }
-    if shutdown.load(Ordering::Relaxed) { return; }
-
-    let mut shm_buf: Option<ShmBuffer> = None;
-    let mut gst_format: &'static str = "";
-
-    while !shutdown.load(Ordering::Relaxed) {
-        if state.session_stopped { return; }
-        if state.constraints_dirty {
-            state.constraints_dirty = false;
-            let Some(fmt) = state.shm_format.take() else { return; };
-            const MAX: u32 = 16384;
-            if state.width == 0 || state.height == 0 || state.width > MAX || state.height > MAX { return; }
-            let needs = shm_buf.as_ref().is_none_or(|b| b.width != state.width || b.height != state.height);
-            if needs { shm_buf = Some(new_shm_buffer(&shm, &qh, state.width, state.height, fmt)); }
-            let Some(gf) = gst_video_format(fmt) else { return; };
-            gst_format = gf;
-        }
-        let Some(buf) = shm_buf.as_ref() else {
-            if eq.blocking_dispatch(&mut state).is_err() { return; }
-            continue;
-        };
-
-        let frame = session.create_frame(&qh, ());
-        frame.attach_buffer(&buf.buffer);
-        frame.damage_buffer(0, 0, buf.width as i32, buf.height as i32);
-        frame.capture();
-
-        state.frame_result = None;
-        while state.frame_result.is_none() && !state.session_stopped && !shutdown.load(Ordering::Relaxed) {
-            if eq.blocking_dispatch(&mut state).is_err() { frame.destroy(); return; }
-        }
-        frame.destroy();
-
-        match state.frame_result.take() {
-            Some(FrameResult::Ready) => {
-                let pixels = buf.mmap[..(buf.stride as usize * buf.height as usize)].to_vec();
-                *latest_frame.lock().unwrap() =
-                    Some(LatestFrame { pixels, width: buf.width, height: buf.height, gst_format });
-            }
-            Some(FrameResult::Failed(r)) => {
-                eprintln!("output frame failed: {r:?}");
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            None => return,
-        }
-    }
+    run_capture_session(&mut eq, &mut state, &shm, &session, &slot, &[shutdown], label);
 }
 
-// Feeds mysrc and audiosrc from one loop and one sleep, pacing audio off
-// audio_debt the way stream_chunked paces /webm, so the two cannot drift
-// apart the way two independently sleeping threads did
+// Feeds mysrc and audiosrc from one loop, video stamped as it is pushed,
+// audio where its own due times fall, see AudioFeed
 fn run_output(video: gst_app::AppSrc, audio: Option<(gst_app::AppSrc, u16)>,
               shutdown: Arc<AtomicBool>) {
     ensure_capture();
-    let latest_frame = frames().clone();
-    let mut caps_set = false;
-    if let Some((audiosrc, port)) = &audio {
-        ensure_audio_capture(*port);
-        audiosrc.set_caps(Some(&audio_caps()));
-    }
-
-    let mut audio_debt = Duration::ZERO;
+    let mut video = VideoFeed::new(video);
+    let mut audio = audio.map(|(src, port)| AudioFeed::new(src, port));
+    let mut deadline = Instant::now();
     while !shutdown.load(Ordering::Relaxed) {
-        if let Some(frame) = latest_frame.lock().unwrap().clone() {
-            if !caps_set {
-                let caps = gst::Caps::builder("video/x-raw")
-                    .field("format", frame.gst_format)
-                    .field("width",  frame.width as i32)
-                    .field("height", frame.height as i32)
-                    .field("framerate", gst::Fraction::new(framerate() as i32, 1))
-                    .build();
-                video.set_caps(Some(&caps));
-                caps_set = true;
-            }
-            if video.push_buffer(gst::Buffer::from_slice(frame.pixels)).is_err() {
+        if let Some(frame) = latest_frame() {
+            if !video.push(frame) {
                 return;
             }
         }
-
-        if let Some((audiosrc, _)) = &audio {
-            audio_debt += frame_interval();
-            while audio_debt >= Duration::from_millis(20) {
-                if audiosrc.push_buffer(gst::Buffer::from_slice(next_audio_chunk())).is_err() {
-                    return;
-                }
-                audio_debt -= Duration::from_millis(20);
-            }
+        if !audio.as_mut().is_none_or(|a| a.push()) {
+            return;
         }
-
-        std::thread::sleep(frame_interval());
+        next_turn(&mut deadline);
     }
 }
 
@@ -1750,7 +1646,7 @@ fn main() {
             // it is silence when no media view is up
             let audio_port = args.audio_port;
             let audio_branch = if audio_port != 0 {
-                " appsrc name=audiosrc is-live=true do-timestamp=true format=time \
+                " appsrc name=audiosrc is-live=true format=time \
                   caps=audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved \
                   ! queue ! audioconvert ! audioresample \
                   ! opusenc bitrate=96000 \
@@ -1790,7 +1686,7 @@ fn main() {
             let (default_w, default_h) = args.width.zip(args.height)
                 .or_else(|| query_output_size())
                 .unwrap_or_else(|| {
-                    eprintln!("toplevel: could not query wl_output size; falling back to 1920×1080");
+                    eprintln!("toplevel: could not query wl_output size; falling back to 1920x1080");
                     (1920, 1080)
                 });
 
