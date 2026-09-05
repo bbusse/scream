@@ -45,7 +45,10 @@ const PROTOCOL_INFO: &str = "http-get:*:video/x-matroska:\
 static ADVERTISE_URL: OnceLock<Option<String>> = OnceLock::new();
 
 pub fn set_advertise_url(url: Option<String>) {
-    let _ = ADVERTISE_URL.set(url.map(|u| u.trim_end_matches('/').to_string()));
+    let _ = ADVERTISE_URL.set(url.map(|u| {
+        let u = u.trim_end_matches('/');
+        if u.contains("://") { u.to_string() } else { format!("http://{u}") }
+    }));
 }
 
 fn advertise_url() -> Option<&'static str> {
@@ -135,14 +138,20 @@ fn bind_ssdp_port(port: u16) -> io::Result<UdpSocket> {
     Ok(sock.into())
 }
 
+// The advertised base url if the operator set one, otherwise whatever fallback
+// the caller computes. Lazy, so a caller with a cheap advertised url skips the
+// work of finding its own address
+fn base_url_or(fallback: impl FnOnce() -> Option<String>) -> Option<String> {
+    match advertise_url() {
+        Some(base) => Some(base.to_string()),
+        None => fallback(),
+    }
+}
+
 // Base url to hand a client, either the operator-provided one or, toward a
 // given peer, whatever local address routes there
 fn client_base_url(http_port: u16, toward: SocketAddr) -> Option<String> {
-    if let Some(base) = advertise_url() {
-        return Some(base.to_string());
-    }
-    let ip = address_toward(toward)?;
-    Some(format!("http://{ip}:{http_port}"))
+    base_url_or(|| Some(format!("http://{}:{http_port}", address_toward(toward)?)))
 }
 
 fn location(http_port: u16, toward: SocketAddr) -> Option<String> {
@@ -223,7 +232,7 @@ impl SsdpIo for MulticastIo {
 }
 
 // tunnel frame: 4-byte IPv4 + 2-byte port, big-endian, then the datagram.
-// scream->relay the address is the destination, relay->scream it is the
+// From scream, the address is the destination, from the relay, it is the
 // source peer. A zero-length payload is a keepalive that only refreshes the
 // relay's idea of where to reach this scream (and holds a NAT mapping open)
 fn encode_frame(addr: SocketAddr, payload: &[u8]) -> Vec<u8> {
@@ -255,21 +264,28 @@ pub struct TunnelIo {
 }
 
 impl TunnelIo {
-    pub fn connect(relay: &str) -> io::Result<Self> {
+    pub fn connect(relay: &str, shutdown: Arc<AtomicBool>) -> io::Result<Self> {
         let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
         sock.connect(relay)?;
         sock.set_read_timeout(Some(Duration::from_secs(1)))?;
 
         // Announce ourselves and keep the relay's return path (and any NAT in
-        // between) alive while the loop is quiet
+        // between) alive while the loop is quiet. Polls shutdown rather than
+        // sleeping the whole 15s so the thread ends with ssdp_loop instead of
+        // outliving it until the process exits
         let keepalive = sock.try_clone()?;
         std::thread::spawn(move || {
             let ping = encode_frame(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)), &[]);
-            loop {
+            while !shutdown.load(Ordering::Relaxed) {
                 if keepalive.send(&ping).is_err() {
                     return;
                 }
-                std::thread::sleep(Duration::from_secs(15));
+                for _ in 0..30 {
+                    if shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                }
             }
         });
 
@@ -303,11 +319,11 @@ pub struct SsdpConfig {
     pub relay: Option<String>,
 }
 
-fn build_io(cfg: &SsdpConfig) -> io::Result<Box<dyn SsdpIo>> {
+fn build_io(cfg: &SsdpConfig, shutdown: Arc<AtomicBool>) -> io::Result<Box<dyn SsdpIo>> {
     match &cfg.relay {
         Some(addr) => {
             println!("SSDP: tunnelling to relay {addr}");
-            Ok(Box::new(TunnelIo::connect(addr)?))
+            Ok(Box::new(TunnelIo::connect(addr, shutdown)?))
         }
         None => Ok(Box::new(MulticastIo::bind()?)),
     }
@@ -316,7 +332,7 @@ fn build_io(cfg: &SsdpConfig) -> io::Result<Box<dyn SsdpIo>> {
 pub fn spawn_ssdp(cfg: SsdpConfig, shutdown: Arc<AtomicBool>) {
     set_advertise_url(cfg.advertise.clone());
     std::thread::spawn(move || {
-        let io = match build_io(&cfg) {
+        let io = match build_io(&cfg, shutdown.clone()) {
             Ok(io) => io,
             Err(e) => {
                 eprintln!("ssdp: {e}");
@@ -379,7 +395,7 @@ pub fn run_relay(listen: &str, iface: Ipv4Addr, lan_port: u16) -> io::Result<()>
     // scream instances that have spoken to us recently
     let clients: Arc<Mutex<HashMap<SocketAddr, Instant>>> = Arc::new(Mutex::new(HashMap::new()));
 
-    // scream -> LAN
+    // scream to LAN
     let up = {
         let clients = clients.clone();
         let lan = lan.try_clone()?;
@@ -398,7 +414,7 @@ pub fn run_relay(listen: &str, iface: Ipv4Addr, lan_port: u16) -> io::Result<()>
         })
     };
 
-    // LAN -> scream
+    // LAN to scream
     let mut buf = [0u8; 2048];
     loop {
         let (n, from) = match lan.recv_from(&mut buf) {
@@ -615,14 +631,10 @@ fn soap_action(headers: &[(String, String)]) -> Option<String> {
 // The base url to write into responses: the advertised one, else whatever
 // address this connection came in on
 fn response_base_url(stream: &TcpStream) -> String {
-    if let Some(base) = advertise_url() {
-        return base.to_string();
-    }
-    let host = stream
-        .local_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_default();
-    format!("http://{host}")
+    base_url_or(|| {
+        let host = stream.local_addr().map(|a| a.to_string()).unwrap_or_default();
+        Some(format!("http://{host}"))
+    }).unwrap_or_default()
 }
 
 // Answers a /dlna request on the shared http socket. Returns false for a

@@ -45,6 +45,16 @@ impl Request {
         if !body.is_empty() {
             reader.read_exact(&mut body).ok()?;
         }
+        // A body longer than the cap is kept for framing, not for content:
+        // the rest still has to come off the wire or it corrupts the next
+        // request on a kept-alive connection
+        let mut discard = [0u8; 4096];
+        let mut remaining = length - body.len();
+        while remaining > 0 {
+            let n = remaining.min(discard.len());
+            reader.read_exact(&mut discard[..n]).ok()?;
+            remaining -= n;
+        }
 
         Some(Request { method, target, headers, body })
     }

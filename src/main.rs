@@ -24,7 +24,7 @@ use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::OnceLock;
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, Weak};
 use std::time::Duration;
 use wayland_client::protocol::{
     wl_buffer::WlBuffer,
@@ -71,10 +71,10 @@ struct Args {
     /// Port to bind the RTSP server to
     #[arg(long, default_value = "7001")]
     bind_port: String,
-    /// Composite canvas width; defaults to wl_output width (toplevel mode only)
+    /// Composite canvas width, defaults to wl_output width (toplevel mode only)
     #[arg(long)]
     width: Option<u32>,
-    /// Composite canvas height; defaults to wl_output height (toplevel mode only)
+    /// Composite canvas height, defaults to wl_output height (toplevel mode only)
     #[arg(long)]
     height: Option<u32>,
     /// Frames per second to capture and encode
@@ -83,7 +83,7 @@ struct Args {
     /// Port for the http mjpeg stream a browser can display, 0 disables it
     #[arg(long, default_value = "7002")]
     http_port: u16,
-    /// Port the media player relays stream audio to, opus over rtp; 0 disables
+    /// Port the media player relays stream audio to, opus over rtp, 0 disables
     #[arg(long, env = "STREAM_AUDIO_PORT", default_value = "7005")]
     audio_port: u16,
     /// Do not announce the stream over ssdp for dlna players
@@ -95,13 +95,13 @@ struct Args {
     stream_title: String,
     /// Base URL clients should reach this stream at, e.g.
     /// http://192.168.1.10:7002. Overrides the address scream autodetects for
-    /// the ssdp LOCATION and the DLNA stream url; needed behind a NAT or in a
+    /// the ssdp LOCATION and the DLNA stream url. Needed behind a NAT or in a
     /// container where the published port differs from the internal one
     #[arg(long, env = "STREAM_ADVERTISE_URL")]
     advertise_url: Option<String>,
     /// Tunnel ssdp over one unicast udp connection to a `scream
     /// --ssdp-relay-server` at this host:port instead of speaking multicast
-    /// directly; use when multicast cannot leave the container/VM, e.g.
+    /// directly. Use when multicast cannot leave the container/VM, e.g.
     /// host.containers.internal:1901
     #[arg(long, env = "STREAM_SSDP_RELAY")]
     ssdp_relay: Option<String>,
@@ -113,11 +113,11 @@ struct Args {
     /// Address the relay accepts scream instances on (--ssdp-relay-server)
     #[arg(long, default_value = "0.0.0.0:1901")]
     ssdp_relay_listen: String,
-    /// Local IPv4 address to join the ssdp group on (--ssdp-relay-server);
+    /// Local IPv4 address to join the ssdp group on (--ssdp-relay-server),
     /// 0.0.0.0 uses the default-route interface
     #[arg(long, default_value = "0.0.0.0")]
     ssdp_relay_iface: String,
-    /// UDP port the relay listens for the ssdp group on (--ssdp-relay-server);
+    /// UDP port the relay listens for the ssdp group on (--ssdp-relay-server),
     /// 1900 is the standard and what clients send M-SEARCH to
     #[arg(long, default_value = "1900")]
     ssdp_relay_lan_port: u16,
@@ -234,10 +234,13 @@ fn ensure_capture() {
 }
 
 // The media player relays the current stream's audio here, opus over rtp. One
-// capture thread decodes it to raw pcm, the rtsp pay1 and every webm client
-// read chunks from the queue, padding silence when nothing is playing
+// capture thread decodes it to raw pcm and fans each chunk out to every
+// subscriber, so the rtsp pay1 and each webm client hear the whole stream
+// instead of splitting chunks between however many are listening at once.
+// Padded with silence when a subscriber's queue is empty
 type PcmQueue = Arc<Mutex<VecDeque<Vec<u8>>>>;
-static AUDIO_PCM: OnceLock<PcmQueue> = OnceLock::new();
+type PcmSubscribers = Mutex<Vec<Weak<Mutex<VecDeque<Vec<u8>>>>>>;
+static AUDIO_SUBSCRIBERS: OnceLock<PcmSubscribers> = OnceLock::new();
 static AUDIO_CAPTURE: AtomicBool = AtomicBool::new(false);
 // Set once from Args so the http handlers can reach it, 0 disables audio
 static AUDIO_PORT: AtomicU16 = AtomicU16::new(0);
@@ -248,9 +251,23 @@ fn audio_port() -> u16 {
 
 // 20 ms of 48 kHz interleaved stereo s16, the opusdec output chunk
 const AUDIO_CHUNK_BYTES: usize = 960 * 2 * 2;
+// The decode thread can outrun run_output briefly, a startup burst or a
+// scheduling hiccup, and nothing shrinks the queue back down again on its
+// own. Left uncapped that lag only grows over a session, so it is pinned to
+// a few chunks here instead of the far larger ceiling that used to let it
+// drift wherever the last stall left it
+const AUDIO_QUEUE_CHUNKS: usize = 4;
 
-fn audio_pcm() -> &'static PcmQueue {
-    AUDIO_PCM.get_or_init(|| Arc::new(Mutex::new(VecDeque::new())))
+fn audio_subscribers() -> &'static PcmSubscribers {
+    AUDIO_SUBSCRIBERS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+// A new queue of this consumer's own, registered to receive every chunk the
+// decode thread produces from here on
+fn subscribe_audio() -> PcmQueue {
+    let q: PcmQueue = Arc::new(Mutex::new(VecDeque::new()));
+    audio_subscribers().lock().unwrap().push(Arc::downgrade(&q));
+    q
 }
 
 fn audio_caps() -> gst::Caps {
@@ -262,10 +279,10 @@ fn audio_caps() -> gst::Caps {
         .build()
 }
 
-// One buffered chunk, or silence when the queue is empty
-fn next_audio_chunk() -> Vec<u8> {
-    audio_pcm()
-        .lock()
+// One buffered chunk from this consumer's own queue, or silence when it is
+// empty
+fn next_audio_chunk(q: &PcmQueue) -> Vec<u8> {
+    q.lock()
         .ok()
         .and_then(|mut q| q.pop_front())
         .unwrap_or_else(|| vec![0u8; AUDIO_CHUNK_BYTES])
@@ -276,10 +293,13 @@ fn ensure_audio_capture(port: u16) {
         return;
     }
     std::thread::spawn(move || {
+        // The media player sends over loopback, so 60 ms covers ordinary
+        // scheduling jitter without adding the far larger fixed delay a real
+        // network hop would need
         let desc = format!(
             "udpsrc port={port} \
              caps=application/x-rtp,media=audio,encoding-name=OPUS,clock-rate=48000,payload=97 \
-             ! rtpjitterbuffer latency=400 mode=none do-lost=true \
+             ! rtpjitterbuffer latency=60 mode=none do-lost=true \
              ! rtpopusdepay ! opusdec plc=true \
              ! audioconvert ! audioresample \
              ! audio/x-raw,format=S16LE,rate=48000,channels=2,layout=interleaved \
@@ -308,12 +328,18 @@ fn ensure_audio_capture(port: u16) {
             match asink.try_pull_sample(gst::ClockTime::from_seconds(1)) {
                 Some(sample) => {
                     if let Some(map) = sample.buffer().and_then(|b| b.map_readable().ok()) {
-                        if let Ok(mut q) = audio_pcm().lock() {
-                            q.push_back(map.as_slice().to_vec());
-                            while q.len() > 64 {
-                                q.pop_front();
+                        let chunk = map.as_slice().to_vec();
+                        let mut subs = audio_subscribers().lock().unwrap();
+                        subs.retain(|weak| {
+                            let Some(q) = weak.upgrade() else { return false };
+                            if let Ok(mut q) = q.lock() {
+                                q.push_back(chunk.clone());
+                                while q.len() > AUDIO_QUEUE_CHUNKS {
+                                    q.pop_front();
+                                }
                             }
-                        }
+                            true
+                        });
                     }
                 }
                 None if asink.is_eos() => break,
@@ -389,9 +415,9 @@ fn serve_http(listener: TcpListener) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         std::thread::spawn(move || {
+            let mut stream = stream;
             // Stops an idle kept-alive connection from pinning its thread
             let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
-            let mut stream = stream;
             loop {
                 match handle_http(&mut stream) {
                     Ok(HttpNext::KeepAlive) => continue,
@@ -584,7 +610,7 @@ fn stream_chunked(stream: &mut TcpStream, mut encoder: StreamEncoder,
 // without hls.js. h264 in matroska is the same shape for dlna players
 struct StreamEncoder {
     appsrc: gst_app::AppSrc,
-    audio: Option<gst_app::AppSrc>,
+    audio: Option<(gst_app::AppSrc, PcmQueue)>,
     sink: gst_app::AppSink,
     pipeline: gst::Pipeline,
     caps_set: bool,
@@ -656,7 +682,7 @@ impl StreamEncoder {
             gst::Element::link_many([asrc.upcast_ref(), &aconv, &ares, &aenc])
                 .map_err(|e| e.to_string())?;
             aenc.link(&mux).map_err(|e| e.to_string())?;
-            Some(asrc)
+            Some((asrc, subscribe_audio()))
         } else {
             None
         };
@@ -682,8 +708,8 @@ impl StreamEncoder {
     }
 
     fn push_audio(&mut self) {
-        if let Some(src) = &self.audio {
-            let _ = src.push_buffer(gst::Buffer::from_slice(next_audio_chunk()));
+        if let Some((src, queue)) = &self.audio {
+            let _ = src.push_buffer(gst::Buffer::from_slice(next_audio_chunk(queue)));
         }
     }
 
@@ -707,7 +733,7 @@ fn latest_jpeg(encoder: &mut JpegEncoder) -> Option<Vec<u8>> {
     encoder.encode(&frame)
 }
 
-// Coordinator — monitors toplevels + wl_output, fires events
+// Coordinator, monitors toplevels + wl_output, fires events
 
 enum CoordEvent {
     NewToplevel { identifier: String, app_id: String, title: String },
@@ -874,7 +900,7 @@ fn coordinator_loop(tx: mpsc::Sender<CoordEvent>, shutdown: Arc<AtomicBool>) {
     }
 }
 
-// Output-size query — blocking, one-shot
+// Output-size query, blocking, one-shot
 
 #[derive(Default)]
 struct SizeQueryState {
@@ -1389,7 +1415,7 @@ impl CompositorPipeline {
 
 type SharedPipeline = Arc<Mutex<CompositorPipeline>>;
 
-// Pipeline manager — receives coordinator events and mutates the live pipeline
+// Pipeline manager, receives coordinator events and mutates the live pipeline
 fn pipeline_manager(
     shared: SharedPipeline,
     rx: mpsc::Receiver<CoordEvent>,
@@ -1440,7 +1466,7 @@ fn pipeline_manager(
     }
 }
 
-// GStreamer feed loop — pushes the latest captured frame for each stream at 30 fps
+// GStreamer feed loop, pushes the latest captured frame for each stream at 30 fps
 fn feed_loop(shared: SharedPipeline, shutdown: Arc<AtomicBool>) {
     while !shutdown.load(Ordering::Relaxed) {
         {
@@ -1658,10 +1684,11 @@ fn run_output(video: gst_app::AppSrc, audio: Option<(gst_app::AppSrc, u16)>,
     ensure_capture();
     let latest_frame = frames().clone();
     let mut caps_set = false;
-    if let Some((audiosrc, port)) = &audio {
-        ensure_audio_capture(*port);
+    let audio = audio.map(|(audiosrc, port)| {
+        ensure_audio_capture(port);
         audiosrc.set_caps(Some(&audio_caps()));
-    }
+        (audiosrc, subscribe_audio())
+    });
 
     let mut audio_debt = Duration::ZERO;
     while !shutdown.load(Ordering::Relaxed) {
@@ -1681,10 +1708,10 @@ fn run_output(video: gst_app::AppSrc, audio: Option<(gst_app::AppSrc, u16)>,
             }
         }
 
-        if let Some((audiosrc, _)) = &audio {
+        if let Some((audiosrc, queue)) = &audio {
             audio_debt += frame_interval();
             while audio_debt >= Duration::from_millis(20) {
-                if audiosrc.push_buffer(gst::Buffer::from_slice(next_audio_chunk())).is_err() {
+                if audiosrc.push_buffer(gst::Buffer::from_slice(next_audio_chunk(queue))).is_err() {
                     return;
                 }
                 audio_debt -= Duration::from_millis(20);
