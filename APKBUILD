@@ -15,8 +15,8 @@ depends="gst-plugins-base gst-plugins-good gst-plugins-ugly gst-rtsp-server"
 makedepends="cargo rust gstreamer-dev gst-rtsp-server-dev gst-plugins-base-dev glib-dev wayland-dev wayland-protocols-dev"
 # Built directly from this checkout (no source= fetch), so builddir points
 # straight at $startdir. srcdir is redirected off to the side: abuild's
-# default srcdir ($startdir/src) collides with - and gets wiped by abuild
-# before build() runs - this project's own src/ directory.
+# default srcdir ($startdir/src) is this project's own src/ directory, which
+# abuild would wipe before build() runs
 srcdir="$startdir/.abuild-src"
 builddir="$startdir"
 

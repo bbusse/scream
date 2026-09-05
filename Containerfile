@@ -1,16 +1,12 @@
-# Containerfile for building scream, packaged as a signed Alpine (.apk)
-# package via abuild/APKBUILD (see APKBUILD at the repo root).
+# Builds scream as a signed Alpine package via abuild and the APKBUILD at the
+# repo root. A build artifact, not a runnable image: it produces
+# /apk/scream.apk. Consumers install it with `apk add scream.apk`, verified
+# against keys/apk-releases.rsa.pub. The gstreamer dependencies are declared
+# in APKBUILD and pulled in with it, the binary lands at /usr/bin/scream, so
+# no LD_LIBRARY_PATH, GST_PLUGIN_PATH or launcher script is needed
 #
-# This is a build artifact, not a runnable image: it produces
-# /apk/scream.apk. Consumers install it with `apk add scream.apk` (using
-# keys/apk-releases.rsa.pub to verify the signature) - dependencies
-# (gstreamer, gst-plugins-base/good/ugly, gst-rtsp-server) are declared in
-# APKBUILD and get pulled in automatically, and the binary lands at the
-# standard /usr/bin/scream, so no custom LD_LIBRARY_PATH/GST_PLUGIN_PATH or
-# launcher script is needed - just `apk add` and run `scream`.
-#
-# Signing requires the real private key (paired with keys/apk-releases.rsa.pub)
-# at build time, supplied as a secret - never baked into the image:
+# Signing needs the private key paired with keys/apk-releases.rsa.pub at
+# build time, supplied as a secret and never baked into the image:
 #   podman build --secret id=abuild_privkey,src=/path/to/apk-releases.rsa .
 FROM alpine:edge
 RUN apk update && apk add --no-cache alpine-sdk sudo
