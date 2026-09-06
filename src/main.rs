@@ -893,11 +893,19 @@ impl StreamEncoder {
     // scream already muxes for rtsp pay1
     fn webm(audio_port: u16) -> Result<Self, String> {
         // deadline=1 is vp8's realtime mode, without it the encoder happily
-        // spends far longer than a frame interval on a frame
+        // spends far longer than a frame interval on a frame. The bitrate
+        // is x264enc's default, so the browser sees the same picture as an
+        // rtsp player, vp8enc's own default is 256 kbit/s. cbr holds it
+        // there for a live stream, and the static threshold is what vpx
+        // documents for screen content: unchanged blocks cost nothing
         let enc = gst::ElementFactory::make("vp8enc")
             .property("deadline", 1i64)
             .property("cpu-used", 8i32)
             .property("threads", 2i32)
+            .property("target-bitrate", 2_048_000i32)
+            .property_from_str("end-usage", "cbr")
+            .property("static-threshold", 100i32)
+            .property("keyframe-max-dist", 60i32)
             .build().map_err(|e| e.to_string())?;
         let mux = gst::ElementFactory::make("webmmux")
             .property("streamable", true)
