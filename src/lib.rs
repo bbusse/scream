@@ -8,6 +8,7 @@
 // Copyright (c) 2026 Björn Busse
 
 pub mod dlna;
+pub mod hls;
 pub mod http;
 pub mod layout;
 pub mod metrics;

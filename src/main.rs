@@ -7,11 +7,12 @@ use clap::Parser;
 use gstreamer::{self as gst, prelude::*};
 
 use scream::dlna;
+use scream::hls;
 use scream::http::Request;
 use scream::layout::Grid;
 use scream::metrics::{
-    self, ClientGuard, CLIENTS_MJPEG, CLIENTS_MKV, CLIENTS_RTSP, CLIENTS_SNAPSHOT,
-    CLIENTS_WEBM, SNAPSHOTS_TOTAL,
+    self, ClientGuard, CLIENTS_HLS, CLIENTS_MJPEG, CLIENTS_MKV, CLIENTS_RTSP,
+    CLIENTS_SNAPSHOT, CLIENTS_TS, CLIENTS_WEBM, SNAPSHOTS_TOTAL,
 };
 use gstreamer_app as gst_app;
 use gstreamer_rtsp_server::prelude::*;
@@ -24,7 +25,7 @@ use std::collections::VecDeque;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::OnceLock;
-use std::sync::{mpsc, Arc, Mutex, Weak};
+use std::sync::{mpsc, Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 use wayland_client::protocol::{
     wl_buffer::WlBuffer,
@@ -585,6 +586,15 @@ fn handle_http(stream: &mut TcpStream) -> std::io::Result<HttpNext> {
         return Ok(HttpNext::KeepAlive);
     }
 
+    // hls is many short requests for one encoder, so it has its own lifetime
+    // and answers keep-alive like /metrics does
+    if path == hls::PLAYLIST_PATH {
+        return serve_hls_playlist(stream);
+    }
+    if let Some(seq) = hls::segment_seq(&path) {
+        return serve_hls_segment(stream, seq);
+    }
+
     match path.as_str() {
         "/snapshot" | "/screenshot" => {
             SNAPSHOTS_TOTAL.fetch_add(1, Ordering::Relaxed);
@@ -629,6 +639,16 @@ fn handle_http(stream: &mut TcpStream) -> std::io::Result<HttpNext> {
                 }
             }
         }
+        "/stream.ts" => {
+            let _guard = ClientGuard::new(&CLIENTS_TS);
+            match StreamEncoder::mpegts_h264(60, audio_port()) {
+                Ok(encoder) => stream_chunked(stream, encoder, "video/mp2t")?,
+                Err(e) => {
+                    log_http(&format!("no mpeg-ts encoder: {e}"));
+                    stream.write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")?;
+                }
+            }
+        }
         "/mjpeg" => {
             let _guard = ClientGuard::new(&CLIENTS_MJPEG);
             let Some(mut encoder) = jpeg_encoder(stream)? else {
@@ -668,29 +688,20 @@ fn stream_chunked(stream: &mut TcpStream, mut encoder: StreamEncoder,
     let mut idle = 0u32;
     let mut deadline = Instant::now();
     loop {
-        match latest_frame() {
-            Some(f) => {
-                idle = 0;
-                if !encoder.push(f) {
-                    log_http("appsrc rejected a buffer, closing");
-                    break;
-                }
-            }
-            None => {
-                idle += 1;
-                if idle > 200 {
-                    log_http("no frames to stream, closing");
-                    break;
-                }
-            }
-        }
-        if !encoder.push_audio() {
-            log_http("audio appsrc rejected a buffer, closing");
+        if let Some(why) = feed_turn(&mut encoder, &mut idle) {
+            log_http(why);
             break;
         }
+        // Everything muxed this turn as one http chunk: mpegtsmux hands
+        // over a buffer per 188 byte packet, one write each would be a
+        // syscall storm
+        let mut muxed = Vec::new();
         while let Some(chunk) = encoder.pull() {
-            write!(stream, "{:x}\r\n", chunk.len())?;
-            stream.write_all(&chunk)?;
+            muxed.extend_from_slice(&chunk.data);
+        }
+        if !muxed.is_empty() {
+            write!(stream, "{:x}\r\n", muxed.len())?;
+            stream.write_all(&muxed)?;
             stream.write_all(b"\r\n")?;
             stream.flush()?;
         }
@@ -699,6 +710,171 @@ fn stream_chunked(stream: &mut TcpStream, mut encoder: StreamEncoder,
     let _ = stream.write_all(b"0\r\n\r\n");
 
     Ok(())
+}
+
+// One feeder turn: the current frame and the audio since the last turn go
+// into the encoder. Some(reason) when the stream cannot go on
+fn feed_turn(encoder: &mut StreamEncoder, idle: &mut u32) -> Option<&'static str> {
+    match latest_frame() {
+        Some(f) => {
+            *idle = 0;
+            if !encoder.push(f) {
+                return Some("appsrc rejected a buffer, closing");
+            }
+        }
+        None => {
+            *idle += 1;
+            if *idle > 200 {
+                return Some("no frames to stream, closing");
+            }
+        }
+    }
+    if !encoder.push_audio() {
+        return Some("audio appsrc rejected a buffer, closing");
+    }
+    None
+}
+
+// The hls encoder is not tied to a connection: a player fetches the playlist
+// and each segment as its own request. So it runs from the first request
+// until HLS_IDLE passes without one, and the segments it cut wait in a ring
+// for the requests that name them. One encoder however many players
+struct HlsState {
+    ring: VecDeque<hls::Segment>,
+    // Carried across runs so sequence numbers never go backwards for a
+    // player that saw the previous run
+    next_seq: u64,
+    last_request: Instant,
+    running: bool,
+    // Why the last run could not start, answered as 503 until the next try
+    error: Option<String>,
+}
+
+struct HlsShared {
+    state: Mutex<HlsState>,
+    changed: Condvar,
+}
+
+static HLS: OnceLock<HlsShared> = OnceLock::new();
+const HLS_IDLE: Duration = Duration::from_secs(10);
+// Longer than starting the encoder and cutting MIN_SEGMENTS takes
+const HLS_START_WAIT: Duration = Duration::from_secs(8);
+
+fn hls_shared() -> &'static HlsShared {
+    HLS.get_or_init(|| HlsShared {
+        state: Mutex::new(HlsState {
+            ring: VecDeque::new(), next_seq: 0, last_request: Instant::now(),
+            running: false, error: None,
+        }),
+        changed: Condvar::new(),
+    })
+}
+
+// Notes a request and starts the encoder if none runs
+fn hls_touch() {
+    let mut st = hls_shared().state.lock().unwrap();
+    st.last_request = Instant::now();
+    if !st.running {
+        st.running = true;
+        st.error = None;
+        std::thread::spawn(hls_run);
+    }
+}
+
+fn hls_run() {
+    let shared = hls_shared();
+    let _guard = ClientGuard::new(&CLIENTS_HLS);
+    let next_seq = shared.state.lock().unwrap().next_seq;
+    let mut segmenter = hls::Segmenter::new(next_seq);
+    let started = StreamEncoder::mpegts_h264(framerate() * hls::SEGMENT_SECS, audio_port());
+    let error = match started {
+        Ok(encoder) => {
+            log_http("hls: encoder started");
+            hls_feed(encoder, &mut segmenter);
+            None
+        }
+        Err(e) => {
+            log_http(&format!("no hls encoder: {e}"));
+            Some(e)
+        }
+    };
+    let mut st = shared.state.lock().unwrap();
+    st.running = false;
+    st.ring.clear();
+    st.next_seq = segmenter.next_seq();
+    st.error = error;
+    shared.changed.notify_all();
+}
+
+fn hls_feed(mut encoder: StreamEncoder, segmenter: &mut hls::Segmenter) {
+    let shared = hls_shared();
+    let mut idle = 0u32;
+    let mut deadline = Instant::now();
+    loop {
+        if let Some(why) = feed_turn(&mut encoder, &mut idle) {
+            log_http(&format!("hls: {why}"));
+            break;
+        }
+        while let Some(chunk) = encoder.pull() {
+            if let Some(segment) = segmenter.push(&chunk.data, chunk.keyframe, chunk.pts) {
+                let mut st = shared.state.lock().unwrap();
+                st.ring.push_back(segment);
+                while st.ring.len() > hls::RING_SEGMENTS {
+                    st.ring.pop_front();
+                }
+                shared.changed.notify_all();
+            }
+        }
+        if shared.state.lock().unwrap().last_request.elapsed() > HLS_IDLE {
+            log_http("hls: no requests, encoder stopped");
+            break;
+        }
+        next_turn(&mut deadline);
+    }
+}
+
+// Waits for enough segments to start a player, 503 when the encoder cannot
+// deliver them. Content-Length and keep-alive: a player refetches the
+// playlist every second on the same connection
+fn serve_hls_playlist(stream: &mut TcpStream) -> std::io::Result<HttpNext> {
+    hls_touch();
+    let shared = hls_shared();
+    let deadline = Instant::now() + HLS_START_WAIT;
+    let mut st = shared.state.lock().unwrap();
+    while st.ring.len() < hls::MIN_SEGMENTS && st.error.is_none() {
+        let Some(left) = deadline.checked_duration_since(Instant::now()) else { break };
+        st = shared.changed.wait_timeout(st, left).unwrap().0;
+    }
+    if st.ring.len() < hls::MIN_SEGMENTS {
+        drop(st);
+        stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nRetry-After: 2\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")?;
+        return Ok(HttpNext::KeepAlive);
+    }
+    let body = hls::playlist(&st.ring);
+    drop(st);
+    stream.write_all(format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.apple.mpegurl\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+        body.len()).as_bytes())?;
+    stream.write_all(body.as_bytes())?;
+    Ok(HttpNext::KeepAlive)
+}
+
+fn serve_hls_segment(stream: &mut TcpStream, seq: u64) -> std::io::Result<HttpNext> {
+    hls_touch();
+    let data = {
+        let st = hls_shared().state.lock().unwrap();
+        st.ring.iter().find(|s| s.seq == seq).map(|s| s.data.clone())
+    };
+    match data {
+        Some(data) => {
+            stream.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: video/mp2t\r\nAccess-Control-Allow-Origin: *\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                data.len()).as_bytes())?;
+            stream.write_all(&data)?;
+        }
+        None => stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")?,
+    }
+    Ok(HttpNext::KeepAlive)
 }
 
 // One encode-and-mux pipeline per http client. vp8 in webm is what a browser
@@ -726,27 +902,52 @@ impl StreamEncoder {
         let mux = gst::ElementFactory::make("webmmux")
             .property("streamable", true)
             .build().map_err(|e| e.to_string())?;
+        let aenc = if audio_port != 0 {
+            Some(gst::ElementFactory::make("opusenc")
+                .property("bitrate", 96_000i32).build().map_err(|e| e.to_string())?)
+        } else {
+            None
+        };
 
-        Self::build(enc, mux, audio_port)
+        Self::build(vec![enc], mux, aenc)
     }
 
-    fn matroska_h264() -> Result<Self, String> {
-        // The same encode the rtsp stream runs, a short keyframe interval so
-        // a player joining the live stream starts within a couple of seconds.
-        // Video only: dlna players are fussy about opus in matroska
-        let enc = gst::ElementFactory::make("x264enc")
+    // The same encode the rtsp stream runs, key_int_max frames between
+    // keyframes: a player joining the live stream starts at the next one
+    fn x264(key_int_max: u32) -> Result<gst::Element, String> {
+        gst::ElementFactory::make("x264enc")
             .property_from_str("speed-preset", "ultrafast")
             .property_from_str("tune", "zerolatency")
-            .property("key-int-max", 60u32)
-            .build().map_err(|e| e.to_string())?;
+            .property("key-int-max", key_int_max)
+            .build().map_err(|e| e.to_string())
+    }
+
+    // Video only: dlna players are fussy about opus in matroska
+    fn matroska_h264() -> Result<Self, String> {
         let mux = gst::ElementFactory::make("matroskamux")
             .property("streamable", true)
             .build().map_err(|e| e.to_string())?;
 
-        Self::build(enc, mux, 0)
+        Self::build(vec![Self::x264(60)?], mux, None)
     }
 
-    fn build(enc: gst::Element, mux: gst::Element, audio_port: u16) -> Result<Self, String> {
+    // h264 and aac in mpeg-ts: the dlna live profile, and what an hls player
+    // takes. h264parse puts SPS and PPS in front of every keyframe so a
+    // segment, or a client joining the chunked stream, decodes from its first
+    // frame. Video only when no aac encoder is installed
+    fn mpegts_h264(key_int_max: u32, audio_port: u16) -> Result<Self, String> {
+        let parse = gst::ElementFactory::make("h264parse")
+            .property("config-interval", -1i32)
+            .build().map_err(|e| e.to_string())?;
+        let mux = gst::ElementFactory::make("mpegtsmux")
+            .build().map_err(|e| e.to_string())?;
+        let aenc = if audio_port != 0 { aac_encoder() } else { None };
+
+        Self::build(vec![Self::x264(key_int_max)?, parse], mux, aenc)
+    }
+
+    fn build(video: Vec<gst::Element>, mux: gst::Element, aenc: Option<gst::Element>)
+             -> Result<Self, String> {
         ensure_capture();
         // The container title a browser or dlna player shows for the stream
         if let Some(ts) = mux.dynamic_cast_ref::<gst::TagSetter>() {
@@ -762,27 +963,27 @@ impl StreamEncoder {
             .is_live(true).do_timestamp(true).format(gst::Format::Time)
             .min_latency(0).max_latency(1_000_000_000).build();
         let convert = gst::ElementFactory::make("videoconvert").build().map_err(|e| e.to_string())?;
-        let sink = gst_app::AppSink::builder().sync(false).max_buffers(4).drop(false).build();
-        pipeline.add_many([appsrc.upcast_ref(), &convert, &enc, &mux, sink.upcast_ref()])
-            .map_err(|e| e.to_string())?;
-        gst::Element::link_many([appsrc.upcast_ref(), &convert, &enc])
-            .map_err(|e| e.to_string())?;
-        enc.link(&mux).map_err(|e| e.to_string())?;
-        mux.link(&sink).map_err(|e| e.to_string())?;
+        // mpegtsmux emits one buffer per ts packet, a bigger queue than the
+        // matroska path needs keeps the feeder from stalling on a keyframe
+        let sink = gst_app::AppSink::builder().sync(false).max_buffers(4096).drop(false).build();
+        let mut chain = vec![appsrc.upcast_ref::<gst::Element>().clone(), convert];
+        chain.extend(video);
+        chain.push(mux.clone());
+        chain.push(sink.upcast_ref::<gst::Element>().clone());
+        pipeline.add_many(&chain).map_err(|e| e.to_string())?;
+        gst::Element::link_many(&chain).map_err(|e| e.to_string())?;
 
-        let audio = if audio_port != 0 {
+        let audio = if let Some(aenc) = aenc {
             let asrc = gst_app::AppSrc::builder()
                 .is_live(true).format(gst::Format::Time).caps(&audio_caps()).build();
             let aconv = gst::ElementFactory::make("audioconvert").build().map_err(|e| e.to_string())?;
             let ares = gst::ElementFactory::make("audioresample").build().map_err(|e| e.to_string())?;
-            let aenc = gst::ElementFactory::make("opusenc")
-                .property("bitrate", 96_000i32).build().map_err(|e| e.to_string())?;
             pipeline.add_many([asrc.upcast_ref(), &aconv, &ares, &aenc])
                 .map_err(|e| e.to_string())?;
             gst::Element::link_many([asrc.upcast_ref(), &aconv, &ares, &aenc])
                 .map_err(|e| e.to_string())?;
             aenc.link(&mux).map_err(|e| e.to_string())?;
-            Some(AudioFeed::new(asrc, audio_port))
+            Some(AudioFeed::new(asrc, audio_port()))
         } else {
             None
         };
@@ -801,12 +1002,37 @@ impl StreamEncoder {
     }
 
     // Only what is already muxed, waiting here would stretch the turn
-    fn pull(&mut self) -> Option<Vec<u8>> {
+    fn pull(&mut self) -> Option<Chunk> {
         let sample = self.sink.try_pull_sample(gst::ClockTime::ZERO)?;
-        let map = sample.buffer()?.map_readable().ok()?;
+        let buffer = sample.buffer()?;
+        let map = buffer.map_readable().ok()?;
 
-        Some(map.as_slice().to_vec())
+        Some(Chunk {
+            data: map.as_slice().to_vec(),
+            keyframe: !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT),
+            pts: buffer.pts().map(Duration::from).unwrap_or_default(),
+        })
     }
+}
+
+// One muxed buffer. keyframe and pts are what the hls segmenter cuts on,
+// mpegtsmux sets the flag on the packet that starts a video keyframe
+struct Chunk {
+    data: Vec<u8>,
+    keyframe: bool,
+    pts: Duration,
+}
+
+// The first aac encoder the installed plugins offer. fdkaacenc is in
+// gst-plugins-bad next to mpegtsmux, avenc_aac in gst-libav
+fn aac_encoder() -> Option<gst::Element> {
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    let found = ["fdkaacenc", "avenc_aac", "voaacenc"].iter()
+        .find_map(|name| gst::ElementFactory::make(name).build().ok());
+    if found.is_none() && !WARNED.swap(true, Ordering::Relaxed) {
+        eprintln!("audio: no aac encoder installed, mpeg-ts and hls are video only");
+    }
+    found
 }
 
 impl Drop for StreamEncoder {
@@ -1713,6 +1939,8 @@ fn main() {
             Ok(listener) => {
                 println!("WebM stream:  http://{addr}/");
                 println!("MKV stream:   http://{addr}/stream.mkv");
+                println!("TS stream:    http://{addr}/stream.ts");
+                println!("HLS stream:   http://{addr}{}", hls::PLAYLIST_PATH);
                 println!("MJPEG stream: http://{addr}/mjpeg");
                 println!("Snapshot:     http://{addr}/snapshot");
                 println!("Metrics:      http://{addr}/metrics");

@@ -11,7 +11,7 @@ license="BSD-3-Clause"
 # pulls that, and on plain Alpine it pulls the stock packages. Depending on
 # gst-moonshine by name needs it in a repo abuild can resolve at build time,
 # which the CI does not have yet.
-depends="gst-plugins-base gst-plugins-good gst-plugins-ugly gst-rtsp-server"
+depends="gst-plugins-base gst-plugins-good gst-plugins-bad gst-plugins-ugly gst-rtsp-server"
 makedepends="cargo rust gstreamer-dev gst-rtsp-server-dev gst-plugins-base-dev glib-dev wayland-dev wayland-protocols-dev"
 # Built directly from this checkout (no source= fetch), so builddir points
 # straight at $startdir. srcdir is redirected off to the side: abuild's
